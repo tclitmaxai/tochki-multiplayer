@@ -1,0 +1,16 @@
+{
+  "name": "tochki-multiplayer-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Минимальный WebSocket-сервер для мультиплеера игры «Точки» — шаг 1-2 плана (общий движок + одна тестовая комната).",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/e2e.js && node test/auth.js && node test/names.js && node test/gamelog.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "ws": "^8.18.0"
+  }
+}

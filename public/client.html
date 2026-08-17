@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Точки — тест мультиплеера (шаг 3: комнаты по коду)</title>
+<style>
+  body{ font-family: 'IBM Plex Mono', monospace; background:#f4efe4; color:#2b2620; text-align:center; padding:20px; }
+  h1{ font-size:1.1rem; font-weight:600; }
+  #status{ margin:10px 0; min-height:1.4em; }
+  #meta{ font-size:0.85rem; color:#7a6f5a; margin-bottom:10px; }
+  canvas{ background:#fbf7ee; border:1.5px solid #2b2620; touch-action:none; cursor:pointer; }
+  .scores{ display:flex; justify-content:center; gap:24px; margin:10px 0; font-size:0.95rem; }
+  .p1{ color:#3b3b7e; } .p2{ color:#8c2a44; }
+  button{ font-family:inherit; padding:6px 14px; border:1.5px solid #2b2620; background:#fbf7ee; cursor:pointer; border-radius:3px; }
+  button:hover{ background:#2b2620; color:#fbf7ee; }
+  input, select{ font-family:inherit; padding:6px 8px; border:1.5px solid #2b2620; border-radius:3px; background:#fbf7ee; }
+  .lobby{ max-width:420px; margin:0 auto; text-align:left; }
+  .lobby section{ border:1.5px solid #2b2620; border-radius:6px; padding:14px 16px; margin-bottom:16px; background:#fbf7ee; }
+  .lobby h2{ font-size:0.95rem; margin:0 0 10px; }
+  .row{ display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .row label{ font-size:0.8rem; flex:1 1 140px; }
+  .code-display{ font-size:1.6rem; letter-spacing:0.15em; font-weight:600; text-align:center; margin:8px 0; }
+  #hidden-until-room{ display:none; }
+  .account{ max-width:420px; margin:0 auto 16px; text-align:left; border:1.5px solid #2b2620; border-radius:6px; padding:14px 16px; background:#fbf7ee; }
+  .account h2{ font-size:0.95rem; margin:0 0 10px; }
+  .account .tabs{ display:flex; gap:8px; margin-bottom:10px; }
+  .account .tabs button{ flex:1; }
+  .account .tabs button.active{ background:#2b2620; color:#fbf7ee; }
+  .account input{ width:100%; box-sizing:border-box; margin-bottom:8px; }
+  .account .msg{ font-size:0.82rem; min-height:1.3em; margin-bottom:6px; }
+  .account .msg.err{ color:#8c2a44; }
+  .account .msg.ok{ color:#2b6e3f; }
+  .account .whoami{ display:flex; justify-content:space-between; align-items:center; }
+</style>
+</head>
+<body>
+  <h1>Точки — тест мультиплеера (шаг 3: комнаты по коду)</h1>
+
+  <div id="account" class="account">
+    <div id="accGuest">
+      <div class="tabs">
+        <button id="tabLogin" class="active">Вход</button>
+        <button id="tabRegister">Регистрация</button>
+      </div>
+      <div id="loginForm">
+        <input id="loginLogin" type="text" placeholder="Ник или почта" autocomplete="username">
+        <input id="loginPassword" type="password" placeholder="Пароль" autocomplete="current-password">
+        <button id="loginBtn">Войти</button>
+      </div>
+      <div id="registerForm" style="display:none;">
+        <input id="regNickname" type="text" placeholder="Ник (3–20 символов)" autocomplete="username">
+        <input id="regEmail" type="email" placeholder="Электронная почта" autocomplete="email">
+        <input id="regPassword" type="password" placeholder="Пароль (не менее 6 символов)" autocomplete="new-password">
+        <button id="registerBtn">Зарегистрироваться</button>
+      </div>
+      <div id="accMsg" class="msg"></div>
+    </div>
+    <div id="accUser" style="display:none;">
+      <div class="whoami">
+        <span>Вы вошли как <strong id="accNickname"></strong></span>
+        <button id="logoutBtn">Выйти</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="lobby" class="lobby">
+    <section>
+      <h2>Создать комнату</h2>
+      <div class="row">
+        <label for="sizeKey">Размер поля</label>
+        <select id="sizeKey">
+          <option value="small">Малое</option>
+          <option value="medium" selected>Среднее</option>
+          <option value="large">Большое</option>
+        </select>
+      </div>
+      <div class="row">
+        <label for="targetScore">Победа при очках (0 — выкл.)</label>
+        <input id="targetScore" type="number" min="0" max="9999" value="0" style="width:80px;">
+      </div>
+      <div class="row">
+        <label for="targetFill">Конец при заполнении, % (100 — выкл.)</label>
+        <input id="targetFill" type="number" min="0" max="100" value="100" style="width:80px;">
+      </div>
+      <div class="row">
+        <label style="flex:1 1 200px; display:flex; align-items:center; gap:6px;">
+          <input id="vsBotCheckbox" type="checkbox"> Играть с ботом (вместо второго игрока)
+        </label>
+        <select id="botDifficultySel" style="display:none;">
+          <option value="normal" selected>Бот: обычный</option>
+          <option value="strong">Бот: сильный</option>
+        </select>
+      </div>
+      <button id="createBtn">Создать комнату</button>
+    </section>
+
+    <section>
+      <h2>Присоединиться по коду</h2>
+      <div class="row">
+        <input id="joinCode" type="text" placeholder="Код комнаты" maxlength="5" style="text-transform:uppercase; width:120px;">
+        <button id="joinBtn">Войти</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Быстрый поиск соперника</h2>
+      <div class="row" style="font-size:0.8rem; color:#7a6f5a;">Использует настройки поля и правил из блока «Создать комнату» выше.</div>
+      <div class="row">
+        <button id="findBtn">Искать соперника</button>
+        <button id="cancelFindBtn" style="display:none;">Отменить поиск</button>
+      </div>
+      <div id="findStatus" style="font-size:0.85rem; color:#7a6f5a;"></div>
+    </section>
+
+    <div id="lobbyStatus" style="font-size:0.85rem; color:#7a6f5a;"></div>
+  </div>
+
+  <div id="room" style="display:none;">
+    <div class="code-display">Код комнаты: <span id="roomCode"></span></div>
+    <div id="meta"></div>
+    <div class="scores"><span class="p1"><span id="p1Label">Индиго</span>: <strong id="s1">0</strong></span><span class="p2"><span id="p2Label">Гранат</span>: <strong id="s2">0</strong></span></div>
+    <div id="status">Ждём соперника…</div>
+    <canvas id="board" width="600" height="480"></canvas>
+    <div style="margin-top:10px; display:flex; gap:10px; justify-content:center;">
+      <button id="endBtn">Закончить игру</button>
+      <button id="leaveBtn">Покинуть комнату</button>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const lobbyEl = document.getElementById('lobby');
+  const lobbyStatusEl = document.getElementById('lobbyStatus');
+  const roomEl = document.getElementById('room');
+  const roomCodeEl = document.getElementById('roomCode');
+  const createBtn = document.getElementById('createBtn');
+  const joinBtn = document.getElementById('joinBtn');
+  const joinCodeInput = document.getElementById('joinCode');
+  const findBtn = document.getElementById('findBtn');
+  const cancelFindBtn = document.getElementById('cancelFindBtn');
+  const findStatusEl = document.getElementById('findStatus');
+  const sizeKeySel = document.getElementById('sizeKey');
+  const targetScoreInput = document.getElementById('targetScore');
+  const targetFillInput = document.getElementById('targetFill');
+  const vsBotCheckbox = document.getElementById('vsBotCheckbox');
+  const botDifficultySel = document.getElementById('botDifficultySel');
+
+  vsBotCheckbox.addEventListener('change', () => {
+    botDifficultySel.style.display = vsBotCheckbox.checked ? 'inline-block' : 'none';
+  });
+
+  const canvas = document.getElementById('board');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const metaEl = document.getElementById('meta');
+  const s1El = document.getElementById('s1');
+  const s2El = document.getElementById('s2');
+  const p1LabelEl = document.getElementById('p1Label');
+  const p2LabelEl = document.getElementById('p2Label');
+  const endBtn = document.getElementById('endBtn');
+  const leaveBtn = document.getElementById('leaveBtn');
+
+  // --- Учётная запись (регистрация/вход) ---------------------------------
+  // Это независимый от игры слой: партии по-прежнему можно создавать без
+  // входа (место 1/2, коды комнат и токены переподключения не завязаны на
+  // учётку). Вход даёт только сохранённый профиль (ник/почта), которым
+  // позже можно будет подписывать партии/статистику.
+  const AUTH_KEY = 'tochki_auth_v1';
+  const accGuestEl = document.getElementById('accGuest');
+  const accUserEl = document.getElementById('accUser');
+  const accNicknameEl = document.getElementById('accNickname');
+  const accMsgEl = document.getElementById('accMsg');
+  const tabLoginBtn = document.getElementById('tabLogin');
+  const tabRegisterBtn = document.getElementById('tabRegister');
+  const loginFormEl = document.getElementById('loginForm');
+  const registerFormEl = document.getElementById('registerForm');
+  const loginLoginInput = document.getElementById('loginLogin');
+  const loginPasswordInput = document.getElementById('loginPassword');
+  const regNicknameInput = document.getElementById('regNickname');
+  const regEmailInput = document.getElementById('regEmail');
+  const regPasswordInput = document.getElementById('regPassword');
+  const loginBtn = document.getElementById('loginBtn');
+  const registerBtn = document.getElementById('registerBtn');
+  const logoutBtn = document.getElementById('logoutBtn');
+
+  const AUTH_ERROR_TEXT = {
+    'invalid-nickname': 'Ник должен быть 3–20 символов (буквы, цифры, - или _).',
+    'invalid-email': 'Проверьте формат почты.',
+    'invalid-password': 'Пароль должен быть не короче 6 символов.',
+    'nickname-taken': 'Такой ник уже занят.',
+    'email-taken': 'Такая почта уже зарегистрирована.',
+    'invalid-credentials': 'Неверный ник/почта или пароль.'
+  };
+
+  function getStoredAuth(){
+    try { const raw = localStorage.getItem(AUTH_KEY); return raw ? JSON.parse(raw) : null; }
+    catch (e){ return null; }
+  }
+  function storeAuth(info){
+    try { localStorage.setItem(AUTH_KEY, JSON.stringify(info)); } catch (e){ /* игнорируем */ }
+  }
+  function clearStoredAuth(){
+    try { localStorage.removeItem(AUTH_KEY); } catch (e){ /* игнорируем */ }
+  }
+  function setAccMsg(text, kind){
+    accMsgEl.textContent = text || '';
+    accMsgEl.className = 'msg' + (kind ? ' ' + kind : '');
+  }
+  function showLoggedIn(user){
+    accGuestEl.style.display = 'none';
+    accUserEl.style.display = 'block';
+    accNicknameEl.textContent = user.nickname;
+  }
+  function showLoggedOut(){
+    accGuestEl.style.display = 'block';
+    accUserEl.style.display = 'none';
+  }
+
+  async function apiCall(path, opts){
+    const res = await fetch(path, opts);
+    let body = null;
+    try { body = await res.json(); } catch (e){ /* тело может быть пустым */ }
+    return { ok: res.ok, status: res.status, body: body || {} };
+  }
+
+  tabLoginBtn.addEventListener('click', () => {
+    tabLoginBtn.classList.add('active'); tabRegisterBtn.classList.remove('active');
+    loginFormEl.style.display = 'block'; registerFormEl.style.display = 'none';
+    setAccMsg('');
+  });
+  tabRegisterBtn.addEventListener('click', () => {
+    tabRegisterBtn.classList.add('active'); tabLoginBtn.classList.remove('active');
+    registerFormEl.style.display = 'block'; loginFormEl.style.display = 'none';
+    setAccMsg('');
+  });
+
+  registerBtn.addEventListener('click', async () => {
+    setAccMsg('Регистрируем…');
+    const { ok, body } = await apiCall('/api/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname: regNicknameInput.value, email: regEmailInput.value, password: regPasswordInput.value })
+    });
+    if (!ok){
+      setAccMsg(AUTH_ERROR_TEXT[body.error] || ('Ошибка: ' + body.error), 'err');
+      return;
+    }
+    storeAuth({ token: body.token, user: body.user });
+    setAccMsg('');
+    showLoggedIn(body.user);
+  });
+
+  loginBtn.addEventListener('click', async () => {
+    setAccMsg('Входим…');
+    const { ok, body } = await apiCall('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: loginLoginInput.value, password: loginPasswordInput.value })
+    });
+    if (!ok){
+      setAccMsg(AUTH_ERROR_TEXT[body.error] || ('Ошибка: ' + body.error), 'err');
+      return;
+    }
+    storeAuth({ token: body.token, user: body.user });
+    setAccMsg('');
+    showLoggedIn(body.user);
+  });
+
+  logoutBtn.addEventListener('click', async () => {
+    const stored = getStoredAuth();
+    clearStoredAuth();
+    showLoggedOut();
+    loginLoginInput.value = ''; loginPasswordInput.value = '';
+    if (stored && stored.token){
+      apiCall('/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + stored.token } }).catch(() => {});
+    }
+  });
+
+  (async function initAccount(){
+    const stored = getStoredAuth();
+    if (!stored || !stored.token) return;
+    const { ok, body } = await apiCall('/api/me', { headers: { Authorization: 'Bearer ' + stored.token } });
+    if (ok) showLoggedIn(body.user);
+    else clearStoredAuth();
+  })();
+
+  let seat = null;
+  let snapshot = null;
+  // Имена мест: {1: 'Ник' | null, 2: 'Ник' | null} — приходят от сервера
+  // (playerNames в room-created/room-joined/match-found/reconnected/state)
+  // и отражают ник из учётной записи, если игрок вошёл. null — гость,
+  // тогда используется запасное имя FALLBACK_NAME.
+  let playerNames = { 1: null, 2: null };
+  function displayName(seatNum){
+    return (playerNames && playerNames[seatNum]) || FALLBACK_NAME[seatNum];
+  }
+  const FALLBACK_NAME = { 1: 'Индиго', 2: 'Гранат' };
+  const pad = 30;
+  let cellSize = 30;
+
+  const RECONNECT_KEY = 'tochki_reconnect_v1';
+  const SOCKET_RETRY_DELAY_MS = 1500;
+  const SOCKET_RETRY_MAX = 20;
+  let socketRetries = 0;
+
+  function getStoredReconnect(){
+    try {
+      const raw = localStorage.getItem(RECONNECT_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e){ return null; }
+  }
+  function storeReconnect(info){
+    try { localStorage.setItem(RECONNECT_KEY, JSON.stringify(info)); } catch (e){ /* игнорируем — не критично */ }
+  }
+  function clearStoredReconnect(){
+    try { localStorage.removeItem(RECONNECT_KEY); } catch (e){ /* игнорируем */ }
+  }
+
+  const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  let ws = null;
+
+  const ERROR_TEXT = {
+    'illegal-cell': 'Сюда сходить нельзя (занято или вне дебютной зоны).',
+    'not-your-turn': 'Сейчас не ваш ход.',
+    'room-full': 'Комната уже заполнена.',
+    'room-not-found': 'Комната с таким кодом не найдена.',
+    'already-in-room': 'Вы уже в комнате.',
+    'already-searching': 'Поиск соперника уже идёт.',
+    'not-searching': 'Поиск ещё не запущен.',
+    'reconnect-failed': 'Не удалось переподключиться — партия недоступна или сессия истекла.',
+    'seat-occupied': 'Это место уже занято (партия открыта в другой вкладке?).',
+    'game-over': 'Партия уже завершена.'
+  };
+
+  function currentMatchOptions(){
+    return {
+      sizeKey: sizeKeySel.value,
+      targetScore: parseInt(targetScoreInput.value, 10) || 0,
+      targetFillPercent: parseInt(targetFillInput.value, 10)
+    };
+  }
+  function currentCreateOptions(){
+    const opts = currentMatchOptions();
+    if (vsBotCheckbox.checked){
+      opts.vsBot = true;
+      opts.botDifficulty = botDifficultySel.value;
+    }
+    return opts;
+  }
+
+  // Всё подключение обёрнуто в connectSocket(), чтобы при разрыве связи
+  // (не по нашей инициативе) можно было просто открыть новый WebSocket и,
+  // если у нас есть сохранённый токен от прошлой партии, сразу же
+  // отправить {type:'reconnect', ...} — без перезагрузки страницы.
+  function connectSocket(){
+    ws = new WebSocket(wsUrl);
+
+    ws.addEventListener('open', () => {
+      socketRetries = 0;
+      const stored = getStoredReconnect();
+      if (stored){
+        if (roomEl.style.display === 'none') lobbyStatusEl.textContent = 'Переподключаемся к партии…';
+        else statusEl.textContent = 'Переподключение к серверу…';
+        ws.send(JSON.stringify({ type:'reconnect', code: stored.code, seat: stored.seat, token: stored.token, authToken: currentAuthToken() }));
+      } else {
+        lobbyStatusEl.textContent = 'Соединение с сервером установлено.';
+      }
+    });
+
+    ws.addEventListener('close', () => {
+      const stored = getStoredReconnect();
+      const inRoom = roomEl.style.display !== 'none';
+      if (socketRetries < SOCKET_RETRY_MAX){
+        socketRetries++;
+        if (inRoom) statusEl.textContent = 'Связь с сервером потеряна, пробуем переподключиться…';
+        else if (stored) lobbyStatusEl.textContent = 'Связь потеряна, пробуем переподключиться к партии…';
+        else lobbyStatusEl.textContent = 'Соединение потеряно, пробуем снова…';
+        setTimeout(connectSocket, SOCKET_RETRY_DELAY_MS);
+      } else {
+        const text = 'Не удалось восстановить соединение с сервером.';
+        if (inRoom) statusEl.textContent = text; else lobbyStatusEl.textContent = text;
+      }
+    });
+
+    ws.addEventListener('message', handleMessage);
+  }
+
+  function currentAuthToken(){
+    const stored = getStoredAuth();
+    return stored && stored.token ? stored.token : undefined;
+  }
+
+  createBtn.addEventListener('click', () => {
+    ws.send(JSON.stringify({ type: 'create-room', options: currentCreateOptions(), authToken: currentAuthToken() }));
+  });
+
+  joinBtn.addEventListener('click', () => {
+    const code = joinCodeInput.value.trim().toUpperCase();
+    if (!code) return;
+    ws.send(JSON.stringify({ type: 'join-room', code, authToken: currentAuthToken() }));
+  });
+
+  findBtn.addEventListener('click', () => {
+    findBtn.style.display = 'none';
+    cancelFindBtn.style.display = 'inline-block';
+    findStatusEl.textContent = 'Ищем соперника с такими же настройками…';
+    ws.send(JSON.stringify({ type: 'find-match', options: currentMatchOptions(), authToken: currentAuthToken() }));
+  });
+
+  cancelFindBtn.addEventListener('click', () => {
+    ws.send(JSON.stringify({ type: 'cancel-find' }));
+  });
+
+  leaveBtn.addEventListener('click', () => {
+    clearStoredReconnect();
+    location.reload();
+  });
+
+  function resetFindUI(){
+    findBtn.style.display = 'inline-block';
+    cancelFindBtn.style.display = 'none';
+    findStatusEl.textContent = '';
+  }
+
+  // kind: undefined — обычный вход по коду; 'auto' — сведены матчмейкингом;
+  // 'reconnected' — вернулись после разрыва связи; 'vsBot' — партия с ботом.
+  function enterRoom(code, mySeat, initialSnapshot, kind, names){
+    seat = mySeat;
+    snapshot = initialSnapshot;
+    playerNames = names || { 1: null, 2: null };
+    roomCodeEl.textContent = code;
+    lobbyEl.style.display = 'none';
+    roomEl.style.display = 'block';
+    let extra = '';
+    if (kind === 'vsBot') extra = ' Играете против бота.';
+    else if (kind === 'auto') extra = ' Соперник найден автоматически.';
+    else if (kind === 'reconnected') extra = ' Вы переподключились к партии.';
+    else if (seat === 1) extra = ' Дайте этот код второму игроку.';
+    metaEl.textContent = `Вы играете за ${displayName(seat)} (место ${seat}).` + extra;
+    resize();
+    render();
+  }
+
+  function handleMessage(ev){
+    const msg = JSON.parse(ev.data);
+
+    if (msg.type === 'room-created'){
+      storeReconnect({ code: msg.code, seat: msg.seat, token: msg.token });
+      enterRoom(msg.code, msg.seat, msg.snapshot, msg.vsBot ? 'vsBot' : undefined, msg.playerNames);
+      return;
+    }
+    if (msg.type === 'room-joined'){
+      storeReconnect({ code: msg.code, seat: msg.seat, token: msg.token });
+      enterRoom(msg.code, msg.seat, msg.snapshot, undefined, msg.playerNames);
+      return;
+    }
+    if (msg.type === 'searching'){
+      findStatusEl.textContent = 'Ищем соперника с такими же настройками…';
+      return;
+    }
+    if (msg.type === 'search-cancelled'){
+      resetFindUI();
+      return;
+    }
+    if (msg.type === 'match-found'){
+      resetFindUI();
+      storeReconnect({ code: msg.code, seat: msg.seat, token: msg.token });
+      enterRoom(msg.code, msg.seat, msg.snapshot, 'auto', msg.playerNames);
+      return;
+    }
+    if (msg.type === 'reconnected'){
+      storeReconnect({ code: msg.code, seat: msg.seat, token: msg.token });
+      enterRoom(msg.code, msg.seat, msg.snapshot, msg.vsBot ? 'vsBot' : 'reconnected', msg.playerNames);
+      return;
+    }
+    if (msg.type === 'state'){
+      snapshot = msg.snapshot;
+      if (msg.playerNames) playerNames = msg.playerNames;
+      render();
+      return;
+    }
+    if (msg.type === 'opponent-disconnected'){
+      const seconds = Math.round((msg.graceMs || 0) / 1000);
+      statusEl.textContent = `Соперник отключился — ждём переподключения (до ${seconds} сек)…`;
+      return;
+    }
+    if (msg.type === 'opponent-left'){
+      statusEl.textContent = 'Соперник не вернулся и покинул партию.';
+      return;
+    }
+    if (msg.type === 'error'){
+      const text = ERROR_TEXT[msg.reason] || ('Ошибка: ' + msg.reason);
+      if (msg.reason === 'reconnect-failed' || msg.reason === 'seat-occupied'){
+        // сохранённая сессия больше не действительна — не пытаемся снова
+        clearStoredReconnect();
+      }
+      if (roomEl.style.display === 'none'){
+        lobbyStatusEl.textContent = text;
+        if (msg.reason === 'already-searching' || msg.reason === 'not-searching'){
+          resetFindUI();
+        }
+      } else {
+        statusEl.textContent = text;
+      }
+      return;
+    }
+  }
+
+  connectSocket();
+
+  function resize(){
+    if (!snapshot) return;
+    const { rows, cols } = snapshot;
+    const maxW = Math.min(640, window.innerWidth - 40);
+    cellSize = Math.max(16, Math.min(36, Math.floor((maxW - pad*2) / (cols-1))));
+    canvas.width = pad*2 + cellSize*(cols-1);
+    canvas.height = pad*2 + cellSize*(rows-1);
+  }
+
+  function px(cx){ return pad + cx*cellSize; }
+  function py(cy){ return pad + cy*cellSize; }
+
+  function render(){
+    if (!snapshot) return;
+    const { rows, cols, stone, dead, territory, openingZone, current, scores, gameOver, stonesPlacedTotal } = snapshot;
+    p1LabelEl.textContent = displayName(1);
+    p2LabelEl.textContent = displayName(2);
+    s1El.textContent = scores[1];
+    s2El.textContent = scores[2];
+
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.strokeStyle = 'rgba(43,38,32,0.35)';
+    ctx.lineWidth = 1;
+    for (let x=0; x<cols; x++){
+      ctx.beginPath(); ctx.moveTo(px(x), py(0)); ctx.lineTo(px(x), py(rows-1)); ctx.stroke();
+    }
+    for (let y=0; y<rows; y++){
+      ctx.beginPath(); ctx.moveTo(px(0), py(y)); ctx.lineTo(px(cols-1), py(y)); ctx.stroke();
+    }
+
+    if (stonesPlacedTotal < 2){
+      const zx0 = px(openingZone.minX) - cellSize/2, zy0 = py(openingZone.minY) - cellSize/2;
+      const zx1 = px(openingZone.maxX) + cellSize/2, zy1 = py(openingZone.maxY) + cellSize/2;
+      ctx.save();
+      ctx.fillStyle = 'rgba(184,134,59,0.14)';
+      ctx.fillRect(zx0, zy0, zx1-zx0, zy1-zy0);
+      ctx.strokeStyle = 'rgba(184,134,59,0.6)';
+      ctx.setLineDash([5,4]);
+      ctx.strokeRect(zx0, zy0, zx1-zx0, zy1-zy0);
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (territory[y][x] !== 0){
+          ctx.fillStyle = territory[y][x]===1 ? 'rgba(59,59,126,0.18)' : 'rgba(140,42,68,0.18)';
+          ctx.fillRect(px(x)-cellSize/2, py(y)-cellSize/2, cellSize, cellSize);
+        }
+      }
+    }
+
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (stone[y][x] === 0) continue;
+        const p = stone[y][x];
+        const isDead = dead[y][x] !== 0;
+        ctx.beginPath();
+        ctx.arc(px(x), py(y), cellSize*0.32, 0, Math.PI*2);
+        ctx.fillStyle = p===1 ? '#3b3b7e' : '#8c2a44';
+        ctx.globalAlpha = isDead ? 0.35 : 1;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    if (gameOver){
+      let msg;
+      if (scores[1] > scores[2]) msg = `Побеждает ${displayName(1)}!`;
+      else if (scores[2] > scores[1]) msg = `Побеждает ${displayName(2)}!`;
+      else msg = 'Ничья.';
+      statusEl.textContent = `Игра окончена. Счёт ${scores[1]}:${scores[2]}. ${msg}`;
+    } else {
+      const turnName = displayName(current);
+      const yourTurn = current === seat;
+      statusEl.textContent = `Ходит ${turnName}.` + (yourTurn ? ' Ваш ход!' : ' Ждём соперника…');
+    }
+  }
+
+  function nearestIntersection(mx, my){
+    if (!snapshot) return null;
+    const { rows, cols } = snapshot;
+    const cx = Math.round((mx - pad) / cellSize);
+    const cy = Math.round((my - pad) / cellSize);
+    if (cx<0||cy<0||cx>=cols||cy>=rows) return null;
+    if (Math.abs(mx - px(cx)) > cellSize*0.4 || Math.abs(my - py(cy)) > cellSize*0.4) return null;
+    return [cx, cy];
+  }
+
+  function handlePlace(e){
+    e.preventDefault();
+    if (!snapshot || snapshot.gameOver) return;
+    if (snapshot.current !== seat) return;
+    const rect = canvas.getBoundingClientRect();
+    const point = e.touches ? e.touches[0] : e;
+    const mx = point.clientX - rect.left;
+    const my = point.clientY - rect.top;
+    const cell = nearestIntersection(mx, my);
+    if (!cell) return;
+    ws.send(JSON.stringify({ type: 'move', x: cell[0], y: cell[1] }));
+  }
+
+  canvas.addEventListener('click', handlePlace);
+  canvas.addEventListener('touchstart', handlePlace, { passive:false });
+  endBtn.addEventListener('click', () => ws.send(JSON.stringify({ type: 'end' })));
+  window.addEventListener('resize', () => { resize(); render(); });
+})();
+</script>
+</body>
+</html>
