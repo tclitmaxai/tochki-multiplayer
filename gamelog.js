@@ -74,6 +74,62 @@ function createGameLog(db){
     LIMIT @limit
   `);
 
+  // Текущие "боевые" веса для сложности — последняя (максимальный id) строка
+  // в bot_weights. Если для этой сложности ещё ничего не обучалось — null,
+  // и вызывающий код (server.js) должен подставить дефолт из gameEngine.js.
+  const currentWeightsStmt = db.prepare(`
+    SELECT potential, cohesion, stones, liberty, source, win_rate, games_played, created_at
+    FROM bot_weights WHERE difficulty = ? ORDER BY id DESC LIMIT 1
+  `);
+  const insertWeights = db.prepare(`
+    INSERT INTO bot_weights (difficulty, potential, cohesion, stones, liberty, source, win_rate, games_played, note, created_at)
+    VALUES (@difficulty, @potential, @cohesion, @stones, @liberty, @source, @winRate, @gamesPlayed, @note, @createdAt)
+  `);
+
+  function getCurrentBotWeights(difficulty){
+    const row = currentWeightsStmt.get(difficulty);
+    if (!row) return null;
+    return {
+      potential: row.potential, cohesion: row.cohesion, stones: row.stones, liberty: row.liberty,
+      meta: { source: row.source, winRate: row.win_rate, gamesPlayed: row.games_played, createdAt: row.created_at }
+    };
+  }
+
+  // Вызывается из tools/train-bot.js по итогам self-play подбора — сохраняет
+  // новое "поколение" весов, не трогая предыдущие (история подбора).
+  function saveBotWeights(difficulty, weights, meta){
+    meta = meta || {};
+    insertWeights.run({
+      difficulty,
+      potential: weights.potential, cohesion: weights.cohesion,
+      stones: weights.stones, liberty: weights.liberty,
+      source: meta.source || 'trained',
+      winRate: typeof meta.winRate === 'number' ? meta.winRate : null,
+      gamesPlayed: typeof meta.gamesPlayed === 'number' ? meta.gamesPlayed : null,
+      note: meta.note || null,
+      createdAt: Date.now()
+    });
+  }
+
+  // Выборка сыгранных партий для обучения: полные списки ходов доигранных
+  // партий (по умолчанию — все, не только против бота: партии человек-человек
+  // тоже ценны, из них tools/train-bot.js берёт реальные дебютные ходы людей,
+  // чтобы self-play не варился в собственном соку одинаковых открытий).
+  // status='finished' — abandoned не участвуют, там нет осмысленного исхода.
+  function getFinishedGamesForTraining(opts){
+    opts = opts || {};
+    const limit = Math.max(1, Math.min(5000, opts.limit || 500));
+    const rows = db.prepare(`
+      SELECT id, size_key, target_score, target_fill_percent, vs_bot, bot_difficulty,
+             winner_seat, score1, score2, end_reason, started_at, ended_at
+      FROM games
+      WHERE status = 'finished' ${opts.vsBotOnly ? 'AND vs_bot = 1' : ''}
+      ORDER BY ended_at DESC
+      LIMIT @limit
+    `).all({ limit });
+    return rows.map(g => ({ game: g, moves: movesByGameId.all(g.id) }));
+  }
+
   // Партия создаётся в БД сразу при создании комнаты (а не при первом
   // ходе) — так в лог попадают и партии, где второй игрок так и не
   // подключился (см. abandonIfUnfinished), это тоже полезная информация.
@@ -167,7 +223,8 @@ function createGameLog(db){
 
   return {
     startGame, recordSecondPlayer, recordMove, finish, abandonIfUnfinished,
-    getGameByRoomCode, getStats, getRecentGames
+    getGameByRoomCode, getStats, getRecentGames,
+    getCurrentBotWeights, saveBotWeights, getFinishedGamesForTraining
   };
 }
 

@@ -48,8 +48,15 @@
   const TRAIN_DIFF = { radius:2, candidateCap:14, timeLimit:70, maxDepth:3, branchWide:5, branchMid:4, branchNarrow:3, quiescenceExt:1 };
 
   const BOT_PLAYER = 2;
-  const BOT_WEIGHTS = { potential: 6, cohesion: 1.2, stones: 0.15 };
+  // liberty — вес нового термина «безопасность групп» (см. computeGroupLiberties
+  // / libertyRisk ниже). Без него бот видел опасность окружения только когда
+  // захват уже случился внутри горизонта поиска; с ним — на любой глубине,
+  // потому что риск считается прямо в статической оценке листа.
+  // Значения по умолчанию подобраны вручную и являются стартовой точкой для
+  // tools/train-bot.js — самообучение self-play подбирает их точнее.
+  const BOT_WEIGHTS = { potential: 6, cohesion: 1.2, stones: 0.15, liberty: 5 };
   const CAPTURED_WEIGHT = 100;
+  const DIRS4 = [[1,0],[-1,0],[0,1],[0,-1]];
 
   // ---------- Дебютная зона ----------
   const OPENING_ZONE_SIDE = 4;
@@ -196,7 +203,7 @@
     return result;
   }
 
-  function quickScore(state, rows, cols, x, y, player){
+  function quickScore(state, rows, cols, x, y, player, urgentMap){
     const { stone } = state;
     const opponent = player === 1 ? 2 : 1;
     let s = 0;
@@ -211,6 +218,14 @@
     }
     const cx = cols/2, cy = rows/2;
     s += 0.4 / (1 + Math.hypot(x-cx, y-cy));
+    // Бонус за срочность — см. computeUrgentCells. Без него кандидат-ордеринг
+    // и обрезка по candidateCap/branchFactor могли отбросить единственный
+    // ход, спасающий группу от захвата, ещё до того, как поиск успевал его
+    // увидеть — именно это и выглядело как «бот защищает обречённые точки».
+    if (urgentMap){
+      const bonus = urgentMap.get(y*cols+x);
+      if (bonus) s += bonus;
+    }
     return s;
   }
 
@@ -251,6 +266,94 @@
     return potential;
   }
 
+  // ---------- Свободы групп («атари») ----------
+  //
+  // computeTerritoryPotential выше отвечает на вопрос «какая пустая область
+  // уже полностью замкнута одним игроком» — это факт, наступающий постфактум,
+  // ровно в момент захвата. Он ничего не говорит о том, что группа живых
+  // камней постепенно ЛИШАЕТСЯ путей наружу за несколько ходов до захвата —
+  // а именно это нужно боту, чтобы вовремя защищаться и вовремя окружать
+  // самому. Здесь используется тот же принцип, что «свободы» (liberties) в
+  // го: для связной группы живых камней игрока считаются соседние клетки,
+  // через которые группа ещё может «дышать» (пустые, не занятые соперником).
+  // Если свобод становится мало (1-2), группа в шаге от захвата — даже если
+  // формально до этого момента runCaptures её ещё не тронул.
+  function computeGroupLiberties(state, rows, cols, player){
+    const { stone, dead, territory } = state;
+    const visited = Array.from({length: rows}, () => new Array(cols).fill(false));
+    const groups = [];
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        if (visited[y][x]) continue;
+        if (!(stone[y][x] === player && dead[y][x] === 0)){ visited[y][x] = true; continue; }
+        const stack = [[x,y]];
+        visited[y][x] = true;
+        const cells = [];
+        const libs = new Set();
+        while (stack.length){
+          const [cx,cy] = stack.pop();
+          cells.push([cx,cy]);
+          for (const [dx,dy] of DIRS4){
+            const nx=cx+dx, ny=cy+dy;
+            if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+            if (stone[ny][nx] === player && dead[ny][nx] === 0){
+              if (!visited[ny][nx]){ visited[ny][nx] = true; stack.push([nx,ny]); }
+            } else if (stone[ny][nx] === 0 && dead[ny][nx] === 0 && territory[ny][nx] === 0){
+              libs.add(ny*cols+nx);
+            }
+          }
+        }
+        groups.push({ cells, size: cells.length, liberties: libs.size, libCells: libs });
+      }
+    }
+    return groups;
+  }
+
+  // Риск группы растёт резко нелинейно по мере приближения к «атари»
+  // (1 свобода — следующий ход соперника захватывает группу целиком).
+  // Множитель на size означает, что потеря большой сцепленной группы —
+  // катастрофа, а не мелкая потеря одного камня.
+  function libertyRisk(groups){
+    let risk = 0;
+    for (const g of groups){
+      if (g.liberties <= 1) risk += g.size * 6;
+      else if (g.liberties === 2) risk += g.size * 2.5;
+      else if (g.liberties === 3) risk += g.size * 0.8;
+    }
+    return risk;
+  }
+
+  function hasUrgentAtari(state, rows, cols, player){
+    const opponent = player === 1 ? 2 : 1;
+    const mine = computeGroupLiberties(state, rows, cols, player);
+    if (mine.some(g => g.liberties <= 1)) return true;
+    const theirs = computeGroupLiberties(state, rows, cols, opponent);
+    if (theirs.some(g => g.liberties <= 1)) return true;
+    return false;
+  }
+
+  // Клетки-«свободы» групп в атари (liberties<=2) для обеих сторон,
+  // с бонусом для quickScore/сортировки кандидатов — чтобы срочный ход
+  // (спасти свою группу или добить чужую) не вылетел из top-N кандидатов
+  // при обрезке по candidateCap/branchFactor до того, как поиск вообще
+  // успеет его увидеть.
+  function computeUrgentCells(state, rows, cols, mover){
+    const opponent = mover === 1 ? 2 : 1;
+    const urgent = new Map();
+    const mark = (groups, bonus) => {
+      for (const g of groups){
+        if (g.liberties > 2) continue;
+        const w = g.liberties <= 1 ? bonus * 2.2 : bonus * 1.1;
+        for (const key of g.libCells){
+          if ((urgent.get(key) || 0) < w) urgent.set(key, w);
+        }
+      }
+    };
+    mark(computeGroupLiberties(state, rows, cols, mover), 5);      // спасти свою группу
+    mark(computeGroupLiberties(state, rows, cols, opponent), 4.2); // добить чужую
+    return urgent;
+  }
+
   function evaluateStatic(state, rows, cols, forPlayer, weights){
     const { stone, dead, territory } = state;
     const opponent = forPlayer === 1 ? 2 : 1;
@@ -274,7 +377,17 @@
     const potentialDiff = potential[forPlayer] - potential[opponent];
     const cohesionDiff  = cohesion[forPlayer] - cohesion[opponent];
     const stoneDiff     = liveStones[forPlayer] - liveStones[opponent];
-    return capturedDiff*CAPTURED_WEIGHT + potentialDiff*weights.potential + cohesionDiff*weights.cohesion + stoneDiff*weights.stones;
+
+    // libertyDiff > 0, когда СОПЕРНИК ближе к потере группы, чем forPlayer —
+    // то есть положительно и за собственную оборону, и за давление на чужие
+    // группы. weights.liberty может отсутствовать у старых сохранённых
+    // весов (из БД/прежних версий) — тогда просто не влияет на оценку.
+    const ownGroups = computeGroupLiberties(state, rows, cols, forPlayer);
+    const oppGroups = computeGroupLiberties(state, rows, cols, opponent);
+    const libertyDiff = libertyRisk(oppGroups) - libertyRisk(ownGroups);
+
+    return capturedDiff*CAPTURED_WEIGHT + potentialDiff*weights.potential + cohesionDiff*weights.cohesion
+      + stoneDiff*weights.stones + libertyDiff*(weights.liberty || 0);
   }
 
   function branchFactorForDepth(diff, depth){
@@ -285,7 +398,8 @@
 
   function orderedCandidates(state, rows, cols, player, diff, depth){
     const cand = generateCandidates(state, rows, cols, diff.radius);
-    cand.forEach(c => { c.q = quickScore(state, rows, cols, c.x, c.y, player); });
+    const urgent = computeUrgentCells(state, rows, cols, player);
+    cand.forEach(c => { c.q = quickScore(state, rows, cols, c.x, c.y, player, urgent); });
     cand.sort((a,b) => b.q - a.q);
     return cand.slice(0, branchFactorForDepth(diff, depth));
   }
@@ -304,7 +418,8 @@
   }
 
   function alphaBeta(state, rows, cols, depth, alpha, beta, player, diff, deadline, forPlayer, weights, extensionsLeft){
-    const forcedExtension = depth <= 0 && extensionsLeft > 0 && hasForcingCapture(state, rows, cols, player, diff);
+    const forcedExtension = depth <= 0 && extensionsLeft > 0 &&
+      (hasForcingCapture(state, rows, cols, player, diff) || hasUrgentAtari(state, rows, cols, player));
     if ((depth <= 0 && !forcedExtension) || now() > deadline){
       return evaluateStatic(state, rows, cols, forPlayer, weights);
     }
@@ -342,7 +457,8 @@
 
     let ordered = generateCandidates(state, rows, cols, diff.radius);
     if (!ordered.length) return null;
-    ordered.forEach(c => { c.q = quickScore(state, rows, cols, c.x, c.y, mover); });
+    const urgentTop = computeUrgentCells(state, rows, cols, mover);
+    ordered.forEach(c => { c.q = quickScore(state, rows, cols, c.x, c.y, mover, urgentTop); });
     ordered.sort((a,b) => b.q - a.q);
     ordered = ordered.slice(0, diff.candidateCap);
 
@@ -512,6 +628,7 @@
     OPENING_ZONE_SIDE, getOpeningZone, inZone,
     createEmptyState, cloneState, cellOwner, isWall, runCaptures,
     generateCandidates, quickScore, computeTerritoryPotential, evaluateStatic,
+    computeGroupLiberties, libertyRisk, computeUrgentCells, hasUrgentAtari,
     chooseMove, isBoardFull, countFilledCells, checkEndConditions,
     createMatch
   };

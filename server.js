@@ -422,6 +422,19 @@ function createServer(serverOptions){
     onRoomExpired: (room) => gameLog.abandonIfUnfinished(room)
   });
 
+  // Веса оценочной функции бота — если tools/train-bot.js уже что-то
+  // подобрал для этой сложности, берём последнее "поколение" из БД, иначе
+  // — встроенные в движок значения по умолчанию. Чтение из bot_weights —
+  // это простой индексированный SELECT в SQLite (синхронный, доли мс), так
+  // что дёшево делать его при каждом ходе бота, а не только при старте
+  // сервера: новое поколение весов от train-bot.js подхватывается сразу,
+  // без перезапуска процесса.
+  function botWeightsFor(difficulty){
+    const trained = gameLog.getCurrentBotWeights(difficulty || 'normal');
+    if (trained) return trained;
+    return Engine.BOT_WEIGHTS;
+  }
+
   const httpServer = http.createServer((req, res) => {
     handleApiRequest(req, res, auth, gameLog).then((handled) => {
       if (!handled) serveStatic(req, res);
@@ -498,7 +511,7 @@ function createServer(serverOptions){
       if (!stillThere) return; // комнату успели удалить (не должно случаться так быстро, но проверим)
       const freshSnap = stillThere.match.getSnapshot();
       if (freshSnap.gameOver || freshSnap.current !== stillThere.botSeat) return;
-      const move = stillThere.match.botMove(stillThere.botDifficulty);
+      const move = stillThere.match.botMove(stillThere.botDifficulty, botWeightsFor(stillThere.botDifficulty));
       if (!move) return;
       const result = stillThere.match.applyMove(stillThere.botSeat, move.x, move.y);
       if (!result.ok) return; // защитная проверка — по правилам бот всегда должен ходить легально

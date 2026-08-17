@@ -111,6 +111,27 @@ function openDatabase(dbPath){
       created_at    INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_moves_game_id ON moves (game_id);
+
+    -- Веса оценочной функции бота (см. BOT_WEIGHTS в gameEngine.js).
+    -- Одна строка на "поколение" весов — history, не перезапись; текущими
+    -- считаются веса с наибольшим id для данного difficulty. Так храним
+    -- историю подбора (tools/train-bot.js) и всегда можем откатиться.
+    -- source: 'default' — встроенные в код значения, 'trained' — подобраны
+    -- self-play подбором.
+    CREATE TABLE IF NOT EXISTS bot_weights (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      difficulty     TEXT NOT NULL,
+      potential      REAL NOT NULL,
+      cohesion       REAL NOT NULL,
+      stones         REAL NOT NULL,
+      liberty        REAL NOT NULL,
+      source         TEXT NOT NULL DEFAULT 'trained',
+      win_rate       REAL,
+      games_played   INTEGER,
+      note           TEXT,
+      created_at     INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_bot_weights_difficulty ON bot_weights (difficulty, id);
   `);
 
   return db;
