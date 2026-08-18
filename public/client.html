@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Точки — тест мультиплеера (шаг 3: комнаты по коду)</title>
+<title>Точки — тест мультиплеера (шаг 10: лобби, зрители, реванш)</title>
 <style>
   body{ font-family: 'IBM Plex Mono', monospace; background:#f4efe4; color:#2b2620; text-align:center; padding:20px; }
   h1{ font-size:1.1rem; font-weight:600; }
@@ -31,10 +31,22 @@
   .account .msg.err{ color:#8c2a44; }
   .account .msg.ok{ color:#2b6e3f; }
   .account .whoami{ display:flex; justify-content:space-between; align-items:center; }
+  .room-list{ list-style:none; margin:0; padding:0; }
+  .room-list li{ display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px dashed rgba(43,38,32,0.25); font-size:0.82rem; }
+  .room-list li:last-child{ border-bottom:none; }
+  .room-list .rl-info{ flex:1 1 auto; }
+  .room-list .rl-code{ font-weight:600; letter-spacing:0.06em; }
+  .room-list .rl-status{ font-size:0.75rem; color:#7a6f5a; }
+  .room-list button{ padding:3px 10px; font-size:0.78rem; }
+  #roomListEmpty{ font-size:0.82rem; color:#7a6f5a; }
+  #spectatorBanner{ font-size:0.85rem; color:#7a6f5a; margin-bottom:6px; }
+  #rematchBox{ margin-top:10px; display:none; }
+  #rematchBox button{ margin-right:8px; }
+  #rematchStatus{ font-size:0.85rem; color:#7a6f5a; margin-top:6px; min-height:1.3em; }
 </style>
 </head>
 <body>
-  <h1>Точки — тест мультиплеера (шаг 3: комнаты по коду)</h1>
+  <h1>Точки — тест мультиплеера (шаг 10: лобби, зрители, реванш)</h1>
 
   <div id="account" class="account">
     <div id="accGuest">
@@ -91,6 +103,11 @@
           <option value="strong">Бот: сильный</option>
         </select>
       </div>
+      <div class="row">
+        <label style="flex:1 1 200px; display:flex; align-items:center; gap:6px;">
+          <input id="isPublicCheckbox" type="checkbox"> Показывать комнату в лобби (другие смогут войти или посмотреть)
+        </label>
+      </div>
       <button id="createBtn">Создать комнату</button>
     </section>
 
@@ -112,10 +129,19 @@
       <div id="findStatus" style="font-size:0.85rem; color:#7a6f5a;"></div>
     </section>
 
+    <section>
+      <h2>Открытые комнаты</h2>
+      <div class="row" style="font-size:0.8rem; color:#7a6f5a;">Комнаты, которые создатель отметил «Показывать в лобби» — можно войти (если ждут второго игрока) или посмотреть партию.</div>
+      <div class="row"><button id="refreshRoomsBtn">Обновить список</button></div>
+      <ul id="roomListEl" class="room-list"></ul>
+      <div id="roomListEmpty">Открытых комнат пока нет.</div>
+    </section>
+
     <div id="lobbyStatus" style="font-size:0.85rem; color:#7a6f5a;"></div>
   </div>
 
   <div id="room" style="display:none;">
+    <div id="spectatorBanner" style="display:none;">Вы смотрите чужую партию — ходить нельзя.</div>
     <div class="code-display">Код комнаты: <span id="roomCode"></span></div>
     <div id="meta"></div>
     <div class="scores"><span class="p1"><span id="p1Label">Индиго</span>: <strong id="s1">0</strong></span><span class="p2"><span id="p2Label">Гранат</span>: <strong id="s2">0</strong></span></div>
@@ -124,6 +150,10 @@
     <div style="margin-top:10px; display:flex; gap:10px; justify-content:center;">
       <button id="endBtn">Закончить игру</button>
       <button id="leaveBtn">Покинуть комнату</button>
+    </div>
+    <div id="rematchBox">
+      <button id="rematchBtn">Играть ещё раз</button>
+      <div id="rematchStatus"></div>
     </div>
   </div>
 
@@ -144,6 +174,14 @@
   const targetFillInput = document.getElementById('targetFill');
   const vsBotCheckbox = document.getElementById('vsBotCheckbox');
   const botDifficultySel = document.getElementById('botDifficultySel');
+  const isPublicCheckbox = document.getElementById('isPublicCheckbox');
+  const refreshRoomsBtn = document.getElementById('refreshRoomsBtn');
+  const roomListEl = document.getElementById('roomListEl');
+  const roomListEmptyEl = document.getElementById('roomListEmpty');
+  const spectatorBannerEl = document.getElementById('spectatorBanner');
+  const rematchBoxEl = document.getElementById('rematchBox');
+  const rematchBtn = document.getElementById('rematchBtn');
+  const rematchStatusEl = document.getElementById('rematchStatus');
 
   vsBotCheckbox.addEventListener('change', () => {
     botDifficultySel.style.display = vsBotCheckbox.checked ? 'inline-block' : 'none';
@@ -286,6 +324,7 @@
 
   let seat = null;
   let snapshot = null;
+  let isSpectator = false;
   // Имена мест: {1: 'Ник' | null, 2: 'Ник' | null} — приходят от сервера
   // (playerNames в room-created/room-joined/match-found/reconnected/state)
   // и отражают ник из учётной записи, если игрок вошёл. null — гость,
@@ -324,12 +363,15 @@
     'not-your-turn': 'Сейчас не ваш ход.',
     'room-full': 'Комната уже заполнена.',
     'room-not-found': 'Комната с таким кодом не найдена.',
+    'room-not-public': 'Эту комнату нельзя посмотреть — создатель не открыл её для лобби.',
     'already-in-room': 'Вы уже в комнате.',
     'already-searching': 'Поиск соперника уже идёт.',
     'not-searching': 'Поиск ещё не запущен.',
     'reconnect-failed': 'Не удалось переподключиться — партия недоступна или сессия истекла.',
     'seat-occupied': 'Это место уже занято (партия открыта в другой вкладке?).',
-    'game-over': 'Партия уже завершена.'
+    'game-over': 'Партия уже завершена.',
+    'game-not-over': 'Партия ещё не закончена.',
+    'not-in-room': 'Вы сейчас не в комнате.'
   };
 
   function currentMatchOptions(){
@@ -344,6 +386,10 @@
     if (vsBotCheckbox.checked){
       opts.vsBot = true;
       opts.botDifficulty = botDifficultySel.value;
+    } else if (isPublicCheckbox.checked){
+      // isPublic не имеет смысла для комнаты с ботом (сервер бы всё равно
+      // его проигнорировал) — не отправляем, чтобы не путать намерение.
+      opts.isPublic = true;
     }
     return opts;
   }
@@ -364,6 +410,7 @@
         ws.send(JSON.stringify({ type:'reconnect', code: stored.code, seat: stored.seat, token: stored.token, authToken: currentAuthToken() }));
       } else {
         lobbyStatusEl.textContent = 'Соединение с сервером установлено.';
+        startRoomListPolling();
       }
     });
 
@@ -413,8 +460,72 @@
 
   leaveBtn.addEventListener('click', () => {
     clearStoredReconnect();
+    // Явный уход — сообщаем серверу, чтобы место (или статус зрителя)
+    // освободилось СРАЗУ, а не только после reconnectGraceMs (см. шаг 10).
+    // best-effort: если сокет уже не открыт, страница всё равно перезагрузится.
+    try { ws.send(JSON.stringify({ type:'leave-room' })); } catch (e){ /* игнорируем */ }
     location.reload();
   });
+
+  rematchBtn.addEventListener('click', () => {
+    rematchBtn.disabled = true;
+    rematchStatusEl.textContent = 'Ждём подтверждения от соперника…';
+    ws.send(JSON.stringify({ type:'rematch' }));
+  });
+
+  // --- Список открытых комнат в лобби (шаг 10) ----------------------------
+  let roomListTimer = null;
+
+  function requestRoomList(){
+    if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type:'list-rooms' }));
+  }
+
+  function startRoomListPolling(){
+    requestRoomList();
+    stopRoomListPolling();
+    roomListTimer = setInterval(requestRoomList, 4000);
+  }
+  function stopRoomListPolling(){
+    if (roomListTimer){ clearInterval(roomListTimer); roomListTimer = null; }
+  }
+
+  const ROOM_STATUS_TEXT = { waiting: 'ждёт второго игрока', playing: 'партия идёт' };
+  const SIZE_LABEL = { small: 'Малое', medium: 'Среднее', large: 'Большое' };
+
+  function renderRoomList(rooms){
+    roomListEl.innerHTML = '';
+    roomListEmptyEl.style.display = rooms.length ? 'none' : 'block';
+    for (const r of rooms){
+      const li = document.createElement('li');
+      const info = document.createElement('div');
+      info.className = 'rl-info';
+      const p1 = r.playerNames && r.playerNames[1] ? r.playerNames[1] : 'Индиго';
+      const p2 = r.status === 'playing' ? (r.playerNames && r.playerNames[2] ? r.playerNames[2] : 'Гранат') : null;
+      info.innerHTML = '<span class="rl-code">' + r.code + '</span> · ' + (SIZE_LABEL[r.sizeKey] || r.sizeKey)
+        + '<div class="rl-status">' + (ROOM_STATUS_TEXT[r.status] || r.status)
+        + ' · ' + p1 + (p2 ? ' vs ' + p2 : '')
+        + (r.spectatorCount ? ' · зрителей: ' + r.spectatorCount : '') + '</div>';
+      li.appendChild(info);
+      if (r.status === 'waiting'){
+        const btn = document.createElement('button');
+        btn.textContent = 'Войти';
+        btn.addEventListener('click', () => {
+          ws.send(JSON.stringify({ type:'join-room', code: r.code, authToken: currentAuthToken() }));
+        });
+        li.appendChild(btn);
+      } else {
+        const btn = document.createElement('button');
+        btn.textContent = 'Смотреть';
+        btn.addEventListener('click', () => {
+          ws.send(JSON.stringify({ type:'spectate-room', code: r.code }));
+        });
+        li.appendChild(btn);
+      }
+      roomListEl.appendChild(li);
+    }
+  }
+
+  refreshRoomsBtn.addEventListener('click', requestRoomList);
 
   function resetFindUI(){
     findBtn.style.display = 'inline-block';
@@ -423,22 +534,45 @@
   }
 
   // kind: undefined — обычный вход по коду; 'auto' — сведены матчмейкингом;
-  // 'reconnected' — вернулись после разрыва связи; 'vsBot' — партия с ботом.
+  // 'reconnected' — вернулись после разрыва связи; 'vsBot' — партия с ботом;
+  // 'spectate' — зритель, без места за столом; 'rematch' — новая партия в
+  // той же уже открытой комнате (roomEl уже видим, просто обновляем).
   function enterRoom(code, mySeat, initialSnapshot, kind, names){
+    isSpectator = (kind === 'spectate');
     seat = mySeat;
     snapshot = initialSnapshot;
     playerNames = names || { 1: null, 2: null };
     roomCodeEl.textContent = code;
     lobbyEl.style.display = 'none';
     roomEl.style.display = 'block';
+    stopRoomListPolling();
+    spectatorBannerEl.style.display = isSpectator ? 'block' : 'none';
+    endBtn.style.display = isSpectator ? 'none' : 'inline-block';
+    hideRematchUI();
     let extra = '';
-    if (kind === 'vsBot') extra = ' Играете против бота.';
+    if (kind === 'spectate') extra = '';
+    else if (kind === 'vsBot') extra = ' Играете против бота.';
     else if (kind === 'auto') extra = ' Соперник найден автоматически.';
     else if (kind === 'reconnected') extra = ' Вы переподключились к партии.';
     else if (seat === 1) extra = ' Дайте этот код второму игроку.';
-    metaEl.textContent = `Вы играете за ${displayName(seat)} (место ${seat}).` + extra;
+    metaEl.textContent = isSpectator
+      ? `Партия в комнате ${code}.`
+      : `Вы играете за ${displayName(seat)} (место ${seat}).` + extra;
     resize();
     render();
+    if (!isSpectator && snapshot && snapshot.gameOver) showRematchUI();
+  }
+
+  function showRematchUI(){
+    if (isSpectator) return;
+    rematchBoxEl.style.display = 'block';
+    rematchBtn.disabled = false;
+    rematchBtn.style.display = 'inline-block';
+  }
+  function hideRematchUI(){
+    rematchBoxEl.style.display = 'none';
+    rematchStatusEl.textContent = '';
+    rematchBtn.disabled = false;
   }
 
   function handleMessage(ev){
@@ -473,10 +607,40 @@
       enterRoom(msg.code, msg.seat, msg.snapshot, msg.vsBot ? 'vsBot' : 'reconnected', msg.playerNames);
       return;
     }
+    if (msg.type === 'spectate-joined'){
+      clearStoredReconnect(); // зритель не занимает место — переподключаться как игрок незачем
+      enterRoom(msg.code, null, msg.snapshot, 'spectate', msg.playerNames);
+      return;
+    }
+    if (msg.type === 'room-list'){
+      renderRoomList(msg.rooms || []);
+      return;
+    }
+    if (msg.type === 'left-room'){
+      // Подтверждение собственного leave-room — сам переход в лобби уже
+      // выполняется через location.reload() в обработчике кнопки.
+      return;
+    }
+    if (msg.type === 'room-closed'){
+      statusEl.textContent = 'Комната закрыта на сервере.';
+      return;
+    }
+    if (msg.type === 'rematch-requested'){
+      rematchStatusEl.textContent = `${displayName(msg.seat)} предлагает сыграть ещё раз — нажмите «Играть ещё раз», чтобы согласиться.`;
+      showRematchUI();
+      return;
+    }
+    if (msg.type === 'rematch-started'){
+      const code = roomCodeEl.textContent;
+      storeReconnect({ code, seat: msg.seat, token: msg.token });
+      enterRoom(code, msg.seat, msg.snapshot, msg.vsBot ? 'vsBot' : undefined, msg.playerNames);
+      return;
+    }
     if (msg.type === 'state'){
       snapshot = msg.snapshot;
       if (msg.playerNames) playerNames = msg.playerNames;
       render();
+      if (snapshot.gameOver && !isSpectator) showRematchUI();
       return;
     }
     if (msg.type === 'opponent-disconnected'){
@@ -486,6 +650,7 @@
     }
     if (msg.type === 'opponent-left'){
       statusEl.textContent = 'Соперник не вернулся и покинул партию.';
+      hideRematchUI();
       return;
     }
     if (msg.type === 'error'){
@@ -560,6 +725,38 @@
       }
     }
 
+    // Обводка захваченной области (как в однопользовательской версии,
+    // см. README/issue #3): каждая клетка, ставшая территорией ИЛИ мёртвым
+    // камнем игрока (dead — это захваченный камень соперника ПОД контролем
+    // игрока-победителя, но здесь используется как "владелец клетки" для
+    // самой обводки — dead[y][x] уже хранит id владельца, не побеждённого),
+    // рисует границу по тем сторонам, где сосед не принадлежит тому же
+    // владельцу — так вокруг всей связной захваченной области получается
+    // сплошной контур без обхода полигонов.
+    const ownerAt = (x, y) => {
+      if (x < 0 || y < 0 || x >= cols || y >= rows) return 0;
+      if (dead[y][x] !== 0) return dead[y][x];
+      if (territory[y][x] !== 0) return territory[y][x];
+      return 0;
+    };
+    ctx.save();
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'square';
+    for (let y=0; y<rows; y++){
+      for (let x=0; x<cols; x++){
+        const owner = ownerAt(x, y);
+        if (!owner) continue;
+        ctx.strokeStyle = owner===1 ? 'rgba(59,59,126,0.9)' : 'rgba(140,42,68,0.9)';
+        const left = px(x)-cellSize/2, right = px(x)+cellSize/2;
+        const top = py(y)-cellSize/2, bottom = py(y)+cellSize/2;
+        if (ownerAt(x-1, y) !== owner){ ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(left, bottom); ctx.stroke(); }
+        if (ownerAt(x+1, y) !== owner){ ctx.beginPath(); ctx.moveTo(right, top); ctx.lineTo(right, bottom); ctx.stroke(); }
+        if (ownerAt(x, y-1) !== owner){ ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(right, top); ctx.stroke(); }
+        if (ownerAt(x, y+1) !== owner){ ctx.beginPath(); ctx.moveTo(left, bottom); ctx.lineTo(right, bottom); ctx.stroke(); }
+      }
+    }
+    ctx.restore();
+
     for (let y=0; y<rows; y++){
       for (let x=0; x<cols; x++){
         if (stone[y][x] === 0) continue;
@@ -599,6 +796,7 @@
 
   function handlePlace(e){
     e.preventDefault();
+    if (isSpectator) return;
     if (!snapshot || snapshot.gameOver) return;
     if (snapshot.current !== seat) return;
     const rect = canvas.getBoundingClientRect();

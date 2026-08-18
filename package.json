@@ -7,7 +7,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/e2e.js && node test/auth.js && node test/names.js && node test/gamelog.js"
+    "test": "node test/e2e.js && node test/auth.js && node test/names.js && node test/gamelog.js && node test/rooms.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

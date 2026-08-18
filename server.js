@@ -10,13 +10,17 @@
 //
 // Протокол (JSON-сообщения по WebSocket):
 //   клиент -> сервер:
-//     {type:'create-room', options:{sizeKey, targetScore, targetFillPercent, vsBot, botDifficulty}, authToken?}
+//     {type:'create-room', options:{sizeKey, targetScore, targetFillPercent, vsBot, botDifficulty, isPublic}, authToken?}
 //     {type:'join-room', code, authToken?}
 //     {type:'find-match', options:{sizeKey, targetScore, targetFillPercent}, authToken?}
 //     {type:'cancel-find'}
 //     {type:'reconnect', code, seat, token, authToken?}
 //     {type:'move', x, y}
 //     {type:'end'}
+//     {type:'list-rooms'}                     — шаг 10: список открытых комнат для лобби
+//     {type:'spectate-room', code}            — шаг 10: подключиться зрителем к открытой комнате
+//     {type:'leave-room'}                     — немедленно освободить своё место/уйти из зрителей
+//     {type:'rematch'}                        — шаг 10: сыграть ещё раз в той же комнате
 //   authToken — необязательный токен сессии из /api/login (не путать с
 //   token переподключения к месту, который сервер сам генерирует и
 //   присылает клиенту). Если валиден — сервер подставляет ник вместо
@@ -28,10 +32,30 @@
 //     {type:'search-cancelled'}                      — вышел из очереди
 //     {type:'match-found', code, seat, token, snapshot, playerNames}   — обоим сведённым игрокам
 //     {type:'reconnected', code, seat, token, snapshot, vsBot, playerNames}  — успешно вернувшемуся
-//     {type:'state', snapshot, playerNames, lastMove?, note?}     — рассылается обоим
+//     {type:'state', snapshot, playerNames, lastMove?, note?}     — рассылается обоим (и зрителям)
 //     {type:'opponent-disconnected', seat, graceMs}  — оппонент отвалился, ждём
 //     {type:'opponent-left', seat}                   — оппонент не вернулся — место освобождено
+//     {type:'room-list', rooms:[{code, sizeKey, targetScore, targetFillPercent, status,
+//                                 playerNames, spectatorCount}]}   — ответ на list-rooms
+//     {type:'spectate-joined', code, snapshot, playerNames, vsBot}   — только зрителю
+//     {type:'rematch-requested', seat}         — один из игроков предложил реванш, ждём второго
+//     {type:'rematch-started', seat, token, snapshot, playerNames, vsBot}   — персонально каждому месту
+//     (зрители получают ту же партию через обычный 'state' с новым snapshot)
 //     {type:'error', reason}
+//
+// Шаг 10 — публичные комнаты, зрители и реванш:
+//   При создании комнаты можно пометить её isPublic:true — тогда, пока в
+//   ней свободно место (ждёт второго игрока) ИЛИ партия идёт, она попадает
+//   в список list-rooms и её можно смотреть через spectate-room (только
+//   просмотр состояния, зритель не может ходить). Комнаты с ботом и
+//   приватные (isPublic:false, по умолчанию) в список не попадают.
+//   Реванш: когда партия окончена (gameOver), любой из сидящих за столом
+//   игроков может прислать 'rematch' — сервер ждёт согласия ВТОРОГО живого
+//   игрока (если он ещё в комнате), затем создаёт новую партию с теми же
+//   правилами в той же комнате (новая строка в games, тот же room_code).
+//   Против бота реванш стартует сразу по одному запросу человека. Явное
+//   'leave-room' освобождает место без ожидания reconnectGraceMs — чтобы
+//   можно было сразу же уступить место другому игроку по тому же коду.
 //
 // Шаг 9 — логи партий и статистика (HTTP, не WS):
 //   Каждая партия и каждый применённый ход (человека и бота) пишутся в
@@ -113,7 +137,8 @@ function generateToken(){
 // room = { code, match, seats:{1:ws|null,2:ws|null}, tokens:{1,2},
 //          playerNames:{1,2}, playerUserIds:{1,2}, gameId, moveCount,
 //          options, emptyTimer, graceTimers:{1:timer|null,2:timer|null},
-//          vsBot, botSeat, botDifficulty }
+//          vsBot, botSeat, botDifficulty,
+//          isPublic, spectators:Set<ws>, rematchVotes:Set<seat> }
 function createRoomsRegistry(config){
   const emptyRoomTtlMs = config.emptyRoomTtlMs;
   const reconnectGraceMs = config.reconnectGraceMs;
@@ -160,7 +185,15 @@ function createRoomsRegistry(config){
       graceTimers: { 1: null, 2: null },
       vsBot: false,
       botSeat: null,
-      botDifficulty: null
+      botDifficulty: null,
+      // Шаг 10: комната видна в лобби (list-rooms) и доступна для просмотра
+      // зрителями (spectate-room), только если создатель явно это включил.
+      isPublic: false,
+      spectators: new Set(),
+      // Места (по номеру места), уже согласившиеся сыграть реванш в этой же
+      // комнате — см. обработчик 'rematch'. Сбрасывается при старте новой
+      // партии и при уходе игрока с места.
+      rematchVotes: new Set()
     };
     rooms.set(code, room);
     return room;
@@ -230,13 +263,47 @@ function send(ws, msg){
   if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
 
+// Рассылка обоим местам за столом И всем зрителям (шаг 10) — зрителям
+// уходят те же сообщения о состоянии партии, что и игрокам, кроме тех,
+// что относятся конкретно к месту (это фильтруется на уровне вызывающего
+// кода: приватные per-seat сообщения вроде rematch-started шлются отдельно).
 function broadcastRoom(room, msg){
   send(room.seats[1], msg);
   send(room.seats[2], msg);
+  broadcastSpectators(room, msg);
+}
+
+function broadcastSpectators(room, msg){
+  for (const specWs of room.spectators) send(specWs, msg);
 }
 
 function stateMessage(room, extra){
   return Object.assign({ type: 'state', snapshot: room.match.getSnapshot(), playerNames: room.playerNames }, extra || {});
+}
+
+// Статус комнаты для списка в лобби: 'waiting' — ждёт второго игрока (можно
+// присоединиться по коду), 'playing' — партия идёт (можно только смотреть),
+// null — комната не годится для списка (партия окончена, комната с ботом).
+function roomListStatus(room){
+  if (room.vsBot || !room.isPublic) return null;
+  const snap = room.match.getSnapshot();
+  if (snap.gameOver) return null;
+  if (!room.seats[1] || !room.seats[2]) return 'waiting';
+  return 'playing';
+}
+
+function roomListEntry(room){
+  const status = roomListStatus(room);
+  if (!status) return null;
+  return {
+    code: room.code,
+    sizeKey: room.match.sizeKey,
+    targetScore: room.options.targetScore || 0,
+    targetFillPercent: typeof room.options.targetFillPercent === 'number' ? room.options.targetFillPercent : 100,
+    status,
+    playerNames: room.playerNames,
+    spectatorCount: room.spectators.size
+  };
 }
 
 // Раздача статики из /public — чтобы тестовый клиент открывался прямо с
@@ -382,7 +449,11 @@ function sanitizeRoomOptions(raw){
   const botDifficulty = (typeof raw.botDifficulty === 'string' && Engine.DIFFICULTY[raw.botDifficulty])
     ? raw.botDifficulty
     : 'normal';
-  return { matchOptions, vsBot, botDifficulty };
+  // Комната с ботом никогда не публикуется в лобби — это защищённый
+  // одиночный сценарий, смотреть там особо не на что, а претендовать на
+  // место 2 всё равно нельзя (см. freeSeat).
+  const isPublic = !vsBot && raw.isPublic === true;
+  return { matchOptions, vsBot, botDifficulty, isPublic };
 }
 
 // Матчмейкинг сводит только игроков с ОДИНАКОВЫМИ настройками партии —
@@ -419,7 +490,12 @@ function createServer(serverOptions){
     armSeatGraceTimer, clearSeatGraceTimer
   } = createRoomsRegistry({
     reconnectGraceMs, emptyRoomTtlMs,
-    onRoomExpired: (room) => gameLog.abandonIfUnfinished(room)
+    onRoomExpired: (room) => {
+      gameLog.abandonIfUnfinished(room);
+      // Зрители (шаг 10) не держат место и не участвуют в reconnect —
+      // им нужно явное уведомление, что комната пропала из памяти сервера.
+      broadcastSpectators(room, { type:'room-closed', code: room.code });
+    }
   });
 
   // Веса оценочной функции бота — если tools/train-bot.js уже что-то
@@ -520,11 +596,30 @@ function createServer(serverOptions){
     }, BOT_MOVE_DELAY_MS);
   }
 
+  // Шаг 10: реванш в той же комнате — та же комната/код/правила, но новая
+  // партия (новая строка в games, room.match и moveCount с нуля). Кто сидит
+  // за столом (room.seats/tokens/playerNames) не трогаем — соперник тот же,
+  // если он остался; если он ушёл (см. 'leave-room'), место 2 просто пустое
+  // и ждёт кого угодно нового по тому же коду.
+  function startRematch(room){
+    room.match = Engine.createMatch(room.options);
+    room.moveCount = 0;
+    room.rematchVotes = new Set();
+    room.gameId = gameLog.startGame(room);
+    const snapshot = room.match.getSnapshot();
+    [1, 2].forEach((seat) => {
+      const seatWs = room.seats[seat];
+      if (seatWs) send(seatWs, { type:'rematch-started', seat, token: room.tokens[seat], snapshot, playerNames: room.playerNames, vsBot: room.vsBot });
+    });
+    broadcastSpectators(room, { type:'state', snapshot, playerNames: room.playerNames, note:'rematch-started' });
+  }
+
   wss.on('connection', (ws) => {
     ws.roomCode = null;
     ws.seat = null;
     ws.searching = false;
     ws.searchKey = null;
+    ws.spectating = false;
 
     ws.on('message', (raw) => {
       let msg;
@@ -532,15 +627,16 @@ function createServer(serverOptions){
 
       if (msg.type === 'create-room'){
         if (ws.roomCode) return send(ws, { type:'error', reason:'already-in-room' });
-        const { matchOptions, vsBot, botDifficulty } = sanitizeRoomOptions(msg.options);
+        const { matchOptions, vsBot, botDifficulty, isPublic } = sanitizeRoomOptions(msg.options);
         const room = createRoom(matchOptions);
         room.vsBot = vsBot;
         room.botSeat = vsBot ? 2 : null;
         room.botDifficulty = vsBot ? botDifficulty : null;
+        room.isPublic = isPublic;
         if (vsBot) room.playerNames[2] = botDifficulty === 'strong' ? 'Бот (сильный)' : 'Бот (обычный)';
         const token = seatWithToken(room, 1, ws, resolvePlayer(msg.authToken));
         room.gameId = gameLog.startGame(room);
-        send(ws, { type:'room-created', code: room.code, seat: 1, token, snapshot: room.match.getSnapshot(), vsBot, playerNames: room.playerNames });
+        send(ws, { type:'room-created', code: room.code, seat: 1, token, snapshot: room.match.getSnapshot(), vsBot, isPublic, playerNames: room.playerNames });
         return;
       }
 
@@ -608,6 +704,54 @@ function createServer(serverOptions){
         return;
       }
 
+      if (msg.type === 'list-rooms'){
+        const list = [];
+        for (const room of rooms.values()){
+          const entry = roomListEntry(room);
+          if (entry) list.push(entry);
+        }
+        send(ws, { type:'room-list', rooms: list });
+        return;
+      }
+
+      if (msg.type === 'spectate-room'){
+        if (ws.roomCode) return send(ws, { type:'error', reason:'already-in-room' });
+        const room = getRoom(msg.code);
+        if (!room) return send(ws, { type:'error', reason:'room-not-found' });
+        if (!room.isPublic) return send(ws, { type:'error', reason:'room-not-public' });
+        room.spectators.add(ws);
+        ws.roomCode = room.code;
+        ws.seat = null; // зритель не занимает место — отличает его от игрока в обработчиках ниже
+        ws.spectating = true;
+        send(ws, { type:'spectate-joined', code: room.code, snapshot: room.match.getSnapshot(), playerNames: room.playerNames, vsBot: room.vsBot });
+        return;
+      }
+
+      if (msg.type === 'leave-room'){
+        // Немедленный, явный уход — в отличие от обрыва связи (ws close),
+        // не ждёт reconnectGraceMs: место сразу же становится свободным,
+        // чтобы по тому же коду мог зайти другой игрок (см. README, шаг 10).
+        if (ws.spectating){
+          const room = getRoom(ws.roomCode);
+          if (room) room.spectators.delete(ws);
+          ws.roomCode = null; ws.seat = null; ws.spectating = false;
+          send(ws, { type:'left-room' });
+          return;
+        }
+        const room = getRoom(ws.roomCode);
+        if (!room || !ws.seat) return send(ws, { type:'error', reason:'not-in-room' });
+        const seat = ws.seat;
+        clearSeatGraceTimer(room, seat);
+        room.seats[seat] = null;
+        room.tokens[seat] = null;
+        room.rematchVotes.delete(seat);
+        ws.roomCode = null; ws.seat = null;
+        send(ws, { type:'left-room' });
+        broadcastRoom(room, { type:'opponent-left', seat });
+        if (!room.seats[1] && !room.seats[2]) armEmptyTimer(room);
+        return;
+      }
+
       if (msg.type === 'reconnect'){
         if (ws.roomCode) return send(ws, { type:'error', reason:'already-in-room' });
         const room = getRoom(msg.code);
@@ -658,15 +802,36 @@ function createServer(serverOptions){
         return;
       }
 
+      if (msg.type === 'rematch'){
+        if (!room.match.getSnapshot().gameOver) return send(ws, { type:'error', reason:'game-not-over' });
+        const seat = ws.seat;
+        room.rematchVotes.add(seat);
+        const opponentSeat = seat === 1 ? 2 : 1;
+        const opponentWs = room.seats[opponentSeat];
+        // Против бота, или если за столом больше никого нет (второе место
+        // свободно — соперник ушёл), согласие второй стороны спрашивать не
+        // у кого, реванш стартует сразу по одному запросу.
+        const bothReady = room.vsBot || !opponentWs || room.rematchVotes.has(opponentSeat);
+        if (bothReady) startRematch(room);
+        else send(opponentWs, { type:'rematch-requested', seat });
+        return;
+      }
+
       send(ws, { type:'error', reason:'unknown-message-type' });
     });
 
     ws.on('close', () => {
       removeFromQueue(ws);
       const room = getRoom(ws.roomCode);
-      if (room && ws.seat && room.seats[ws.seat] === ws){
+      if (!room) return;
+      if (ws.spectating){
+        room.spectators.delete(ws);
+        return;
+      }
+      if (ws.seat && room.seats[ws.seat] === ws){
         const seat = ws.seat;
         room.seats[seat] = null;
+        room.rematchVotes.delete(seat);
         broadcastRoom(room, { type:'opponent-disconnected', seat, graceMs: reconnectGraceMs });
         armSeatGraceTimer(room, seat, () => {
           broadcastRoom(room, { type:'opponent-left', seat });
