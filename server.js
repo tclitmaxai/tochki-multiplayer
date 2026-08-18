@@ -425,6 +425,29 @@ async function handleApiRequest(req, res, auth, gameLog){
     return true;
   }
 
+  // Шаг 11: "сколько партий в базе" и "виден ли прогресс дообучения бота".
+  // Открытые GET-эндпоинты, как и /api/games/:code выше, — это read-only
+  // сводка без личных данных (email/пароли не выдаются), просто счётчики
+  // и веса бота. Для боевого продакшена эти два эндпоинта стоит закрыть
+  // отдельной админской авторизацией — здесь её сознательно нет, как и в
+  // остальном прототипе (см. README, «Что дальше»).
+  if (urlPath === '/api/admin/summary' && req.method === 'GET'){
+    sendJson(res, 200, gameLog.getDbSummary());
+    return true;
+  }
+
+  if (urlPath.startsWith('/api/bot/weights/') && req.method === 'GET'){
+    const difficulty = decodeURIComponent(urlPath.slice('/api/bot/weights/'.length));
+    if (!Engine.DIFFICULTY[difficulty]) return sendJson(res, 404, { error: 'unknown-difficulty' }), true;
+    const limit = parseInt(urlObj.searchParams.get('limit'), 10);
+    sendJson(res, 200, {
+      difficulty,
+      current: gameLog.getCurrentBotWeights(difficulty) || { ...Engine.BOT_WEIGHTS, meta: { source: 'default (никогда не дообучался)' } },
+      history: gameLog.getBotWeightsHistory(difficulty, Number.isFinite(limit) ? limit : 50)
+    });
+    return true;
+  }
+
   sendJson(res, 404, { error: 'not-found' });
   return true;
 }

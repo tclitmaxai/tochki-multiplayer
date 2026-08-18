@@ -77,6 +77,14 @@
 
   <div id="lobby" class="lobby">
     <section>
+      <h2>Открытые комнаты</h2>
+      <div class="row" style="font-size:0.8rem; color:#7a6f5a;">Комнаты, которые создатель отметил «Показывать в лобби» — можно войти (если ждут второго игрока) или посмотреть партию.</div>
+      <div class="row"><button id="refreshRoomsBtn">Обновить список</button></div>
+      <ul id="roomListEl" class="room-list"></ul>
+      <div id="roomListEmpty">Открытых комнат пока нет.</div>
+    </section>
+
+    <section>
       <h2>Создать комнату</h2>
       <div class="row">
         <label for="sizeKey">Размер поля</label>
@@ -127,14 +135,6 @@
         <button id="cancelFindBtn" style="display:none;">Отменить поиск</button>
       </div>
       <div id="findStatus" style="font-size:0.85rem; color:#7a6f5a;"></div>
-    </section>
-
-    <section>
-      <h2>Открытые комнаты</h2>
-      <div class="row" style="font-size:0.8rem; color:#7a6f5a;">Комнаты, которые создатель отметил «Показывать в лобби» — можно войти (если ждут второго игрока) или посмотреть партию.</div>
-      <div class="row"><button id="refreshRoomsBtn">Обновить список</button></div>
-      <ul id="roomListEl" class="room-list"></ul>
-      <div id="roomListEmpty">Открытых комнат пока нет.</div>
     </section>
 
     <div id="lobbyStatus" style="font-size:0.85rem; color:#7a6f5a;"></div>
@@ -725,37 +725,76 @@
       }
     }
 
-    // Обводка захваченной области (как в однопользовательской версии,
-    // см. README/issue #3): каждая клетка, ставшая территорией ИЛИ мёртвым
-    // камнем игрока (dead — это захваченный камень соперника ПОД контролем
-    // игрока-победителя, но здесь используется как "владелец клетки" для
-    // самой обводки — dead[y][x] уже хранит id владельца, не побеждённого),
-    // рисует границу по тем сторонам, где сосед не принадлежит тому же
-    // владельцу — так вокруг всей связной захваченной области получается
-    // сплошной контур без обхода полигонов.
-    const ownerAt = (x, y) => {
-      if (x < 0 || y < 0 || x >= cols || y >= rows) return 0;
-      if (dead[y][x] !== 0) return dead[y][x];
-      if (territory[y][x] !== 0) return territory[y][x];
-      return 0;
-    };
-    ctx.save();
-    ctx.lineWidth = 2;
-    ctx.lineCap = 'square';
-    for (let y=0; y<rows; y++){
-      for (let x=0; x<cols; x++){
-        const owner = ownerAt(x, y);
-        if (!owner) continue;
-        ctx.strokeStyle = owner===1 ? 'rgba(59,59,126,0.9)' : 'rgba(140,42,68,0.9)';
-        const left = px(x)-cellSize/2, right = px(x)+cellSize/2;
-        const top = py(y)-cellSize/2, bottom = py(y)+cellSize/2;
-        if (ownerAt(x-1, y) !== owner){ ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(left, bottom); ctx.stroke(); }
-        if (ownerAt(x+1, y) !== owner){ ctx.beginPath(); ctx.moveTo(right, top); ctx.lineTo(right, bottom); ctx.stroke(); }
-        if (ownerAt(x, y-1) !== owner){ ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(right, top); ctx.stroke(); }
-        if (ownerAt(x, y+1) !== owner){ ctx.beginPath(); ctx.moveTo(left, bottom); ctx.lineTo(right, bottom); ctx.stroke(); }
+    // Обводка захваченной области (issue #3 / уточнение: граница должна
+    // идти ПО точкам стены, соединяя их с territory/dead в одну фигуру, а
+    // не останавливаться перед ними, и при этом появляться именно там, где
+    // произошёл захват — а не вокруг каждого одиночного камня). Поэтому:
+    //  1) владелец клетки для обводки — то же понятие "стены", что и в
+    //     runCaptures()/isWall() из gameEngine.js: живой камень игрока,
+    //     его territory ИЛИ его dead-клетка;
+    //  2) связные компоненты одного владельца (4-связность) находим
+    //     заливкой; обводим только те, где внутри реально есть territory
+    //     или dead-клетка (то есть где что-то захвачено) — голая цепочка
+    //     обычных камней без единого захвата контур не получает.
+    // Заливка (см. цикл выше) по-прежнему только по territory — сами точки
+    // уже нарисованы кружками, красить их квадратом ни к чему, а вот
+    // граница обязана идти через них, соединяя стену с захваченной зоной.
+    (function drawCaptureBorders(){
+      const wallOwnerAt = (x, y) => {
+        if (x < 0 || y < 0 || x >= cols || y >= rows) return 0;
+        if (dead[y][x] !== 0) return dead[y][x];
+        if (territory[y][x] !== 0) return territory[y][x];
+        if (stone[y][x] !== 0 && dead[y][x] === 0) return stone[y][x];
+        return 0;
+      };
+      const visited = Array.from({length: rows}, () => new Array(cols).fill(false));
+      const mask = Array.from({length: rows}, () => new Array(cols).fill(false));
+      for (let y=0; y<rows; y++){
+        for (let x=0; x<cols; x++){
+          if (visited[y][x]) continue;
+          const owner = wallOwnerAt(x, y);
+          if (!owner){ visited[y][x] = true; continue; }
+          const stack = [[x,y]];
+          const region = [];
+          let hasCapture = false;
+          visited[y][x] = true;
+          while (stack.length){
+            const [cx,cy] = stack.pop();
+            region.push([cx,cy]);
+            if (dead[cy][cx] === owner || territory[cy][cx] === owner) hasCapture = true;
+            for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+              const nx = cx+dx, ny = cy+dy;
+              if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+              if (visited[ny][nx]) continue;
+              if (wallOwnerAt(nx, ny) !== owner) continue;
+              visited[ny][nx] = true;
+              stack.push([nx, ny]);
+            }
+          }
+          if (hasCapture){
+            for (const [cx,cy] of region) mask[cy][cx] = true;
+          }
+        }
       }
-    }
-    ctx.restore();
+
+      ctx.save();
+      ctx.lineWidth = 2;
+      ctx.lineCap = 'square';
+      for (let y=0; y<rows; y++){
+        for (let x=0; x<cols; x++){
+          if (!mask[y][x]) continue;
+          const owner = wallOwnerAt(x, y);
+          ctx.strokeStyle = owner===1 ? 'rgba(59,59,126,0.9)' : 'rgba(140,42,68,0.9)';
+          const left = px(x)-cellSize/2, right = px(x)+cellSize/2;
+          const top = py(y)-cellSize/2, bottom = py(y)+cellSize/2;
+          if (wallOwnerAt(x-1, y) !== owner){ ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(left, bottom); ctx.stroke(); }
+          if (wallOwnerAt(x+1, y) !== owner){ ctx.beginPath(); ctx.moveTo(right, top); ctx.lineTo(right, bottom); ctx.stroke(); }
+          if (wallOwnerAt(x, y-1) !== owner){ ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(right, top); ctx.stroke(); }
+          if (wallOwnerAt(x, y+1) !== owner){ ctx.beginPath(); ctx.moveTo(left, bottom); ctx.lineTo(right, bottom); ctx.stroke(); }
+        }
+      }
+      ctx.restore();
+    })();
 
     for (let y=0; y<rows; y++){
       for (let x=0; x<cols; x++){

@@ -13,6 +13,8 @@
 // удалена по таймауту недоигранной (никто не вернулся после разрыва).
 // 'abandoned' НЕ считается в статистике побед/поражений — только 'finished'.
 
+const Engine = require('./gameEngine.js');
+
 function createGameLog(db){
   const insertGame = db.prepare(`
     INSERT INTO games (
@@ -84,6 +86,17 @@ function createGameLog(db){
   const insertWeights = db.prepare(`
     INSERT INTO bot_weights (difficulty, potential, cohesion, stones, liberty, source, win_rate, games_played, note, created_at)
     VALUES (@difficulty, @potential, @cohesion, @stones, @liberty, @source, @winRate, @gamesPlayed, @note, @createdAt)
+  `);
+  // Шаг 11: видимость прогресса дообучения бота и общего объёма БД —
+  // см. getDbSummary()/getBotWeightsHistory() ниже и /api/admin/summary,
+  // /api/bot/weights/:difficulty в server.js.
+  const gamesCountByStatusStmt = db.prepare(`SELECT status, COUNT(*) AS n FROM games GROUP BY status`);
+  const movesCountStmt = db.prepare(`SELECT COUNT(*) AS n FROM moves`);
+  const usersCountStmt = db.prepare(`SELECT COUNT(*) AS n FROM users`);
+  const botWeightsCountStmt = db.prepare(`SELECT difficulty, COUNT(*) AS n FROM bot_weights GROUP BY difficulty`);
+  const botWeightsHistoryStmt = db.prepare(`
+    SELECT id, potential, cohesion, stones, liberty, source, win_rate, games_played, note, created_at
+    FROM bot_weights WHERE difficulty = ? ORDER BY id DESC
   `);
 
   function getCurrentBotWeights(difficulty){
@@ -221,10 +234,55 @@ function createGameLog(db){
     return recentGamesStmt.all({ uid: userId, limit: Math.max(1, Math.min(100, limit || 20)) });
   }
 
+  // Шаг 11: "сколько партий сохранено в базе" и "виден ли прогресс
+  // дообучения бота" — сводка по всей БД, без привязки к конкретному
+  // пользователю. totalGames = сумма games.status (in_progress/finished/
+  // abandoned); botWeights[difficulty].generations — сколько раз
+  // tools/train-bot.js УЖЕ сохранял новое поколение весов для этой
+  // сложности (см. saveBotWeights) — если 0, дообучение для неё ни разу
+  // не запускали, и бот играет на встроенных в gameEngine.js дефолтах.
+  function getDbSummary(){
+    const byStatus = {};
+    for (const row of gamesCountByStatusStmt.all()) byStatus[row.status] = row.n;
+    const totalGames = Object.values(byStatus).reduce((a, b) => a + b, 0);
+    const botWeights = {};
+    for (const difficulty of Object.keys(Engine.DIFFICULTY)){
+      const current = currentWeightsStmt.get(difficulty);
+      const countRow = botWeightsCountStmt.all().find((r) => r.difficulty === difficulty);
+      botWeights[difficulty] = {
+        generations: countRow ? countRow.n : 0,
+        current: current ? {
+          potential: current.potential, cohesion: current.cohesion,
+          stones: current.stones, liberty: current.liberty,
+          source: current.source, winRate: current.win_rate,
+          gamesPlayed: current.games_played, createdAt: current.created_at
+        } : null // null = дообучение для этой сложности ещё ни разу не запускали
+      };
+    }
+    return {
+      totalGames,
+      gamesByStatus: byStatus,
+      totalMoves: movesCountStmt.get().n,
+      totalUsers: usersCountStmt.get().n,
+      botWeights
+    };
+  }
+
+  // Полная история поколений весов для одной сложности — самый новый
+  // первым. Это и есть "лог обучения бота": каждая строка — один прогон
+  // tools/train-bot.js (или его часть, если он остановился на поколении,
+  // не улучшившем эталон, — тогда предыдущая строка так и останется
+  // последней). note хранит короткое описание прогона (см. train-bot.js).
+  function getBotWeightsHistory(difficulty, limit){
+    const rows = botWeightsHistoryStmt.all(difficulty);
+    return rows.slice(0, Math.max(1, Math.min(200, limit || 50)));
+  }
+
   return {
     startGame, recordSecondPlayer, recordMove, finish, abandonIfUnfinished,
     getGameByRoomCode, getStats, getRecentGames,
-    getCurrentBotWeights, saveBotWeights, getFinishedGamesForTraining
+    getCurrentBotWeights, saveBotWeights, getFinishedGamesForTraining,
+    getDbSummary, getBotWeightsHistory
   };
 }
 

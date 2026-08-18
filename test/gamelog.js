@@ -192,6 +192,44 @@ async function main(){
   assert.strictEqual(recentGames.body.games.length, 2);
   console.log('OK: /api/stats/me/games отдаёт список сыгранных партий (без abandoned)');
 
+  // --- 6) Шаг 11: сводка по всей БД и лог дообучения бота. ---
+  const summary = await request(port, 'GET', '/api/admin/summary');
+  assert.strictEqual(summary.status, 200);
+  // К этому моменту в БД: обычная (finished), против бота (finished),
+  // заброшенная (abandoned) — минимум 3 партии суммарно.
+  assert.ok(summary.body.totalGames >= 3, 'totalGames должен учитывать все статусы, не только finished');
+  assert.ok(summary.body.gamesByStatus.finished >= 2);
+  assert.ok(summary.body.gamesByStatus.abandoned >= 1);
+  assert.ok(summary.body.totalMoves > 0);
+  assert.ok(summary.body.totalUsers >= 1);
+  assert.strictEqual(summary.body.botWeights.normal.generations, 0, 'дообучение normal ещё не запускали в этом тесте');
+  assert.strictEqual(summary.body.botWeights.normal.current, null);
+  console.log('OK: /api/admin/summary отдаёт число партий по статусам, ходов, пользователей и статус дообучения бота:', {
+    totalGames: summary.body.totalGames, gamesByStatus: summary.body.gamesByStatus
+  });
+
+  const weightsBeforeTraining = await request(port, 'GET', '/api/bot/weights/normal');
+  assert.strictEqual(weightsBeforeTraining.status, 200);
+  assert.strictEqual(weightsBeforeTraining.body.current.meta.source, 'default (никогда не дообучался)');
+  assert.deepStrictEqual(weightsBeforeTraining.body.history, []);
+  console.log('OK: без дообучения /api/bot/weights/normal честно отдаёт дефолт из движка, история пуста');
+
+  // Сохраняем "поколение" весов напрямую через gameLog (эмулируем то, что
+  // в реальности делает tools/train-bot.js) и проверяем, что оно СРАЗУ
+  // видно и в истории, и как текущее — без перезапуска сервера.
+  gameLog.saveBotWeights('normal', { potential: 7, cohesion: 1.4, stones: 0.2, liberty: 6 }, {
+    source: 'trained', winRate: 0.63, gamesPlayed: 24, note: 'тестовое поколение 1'
+  });
+  const weightsAfterTraining = await request(port, 'GET', '/api/bot/weights/normal');
+  assert.strictEqual(weightsAfterTraining.status, 200);
+  assert.strictEqual(weightsAfterTraining.body.current.potential, 7);
+  assert.strictEqual(weightsAfterTraining.body.history.length, 1);
+  assert.strictEqual(weightsAfterTraining.body.history[0].note, 'тестовое поколение 1');
+  const summaryAfterTraining = await request(port, 'GET', '/api/admin/summary');
+  assert.strictEqual(summaryAfterTraining.body.botWeights.normal.generations, 1);
+  assert.strictEqual(summaryAfterTraining.body.botWeights.normal.current.potential, 7);
+  console.log('OK: новое поколение весов (как после tools/train-bot.js) сразу видно в /api/bot/weights и /api/admin/summary');
+
   httpServer.close();
   c1.close(); c2.close(); c4.close();
   console.log('\nВСЕ ПРОВЕРКИ ПРОЙДЕНЫ — ходы, партии и статистика пишутся и читаются корректно.');
