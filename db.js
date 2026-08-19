@@ -15,8 +15,12 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 
+function resolveDbPath(dbPath){
+  return dbPath || process.env.DB_PATH || path.join(__dirname, 'data', 'tochki.db');
+}
+
 function openDatabase(dbPath){
-  dbPath = dbPath || process.env.DB_PATH || path.join(__dirname, 'data', 'tochki.db');
+  dbPath = resolveDbPath(dbPath);
 
   // ':memory:' — отдельный случай для тестов: должен остаться как есть,
   // никакую директорию под него создавать не нужно.
@@ -137,4 +141,4 @@ function openDatabase(dbPath){
   return db;
 }
 
-module.exports = { openDatabase };
+module.exports = { openDatabase, resolveDbPath };

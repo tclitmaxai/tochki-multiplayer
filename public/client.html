@@ -43,6 +43,9 @@
   #rematchBox{ margin-top:10px; display:none; }
   #rematchBox button{ margin-right:8px; }
   #rematchStatus{ font-size:0.85rem; color:#7a6f5a; margin-top:6px; min-height:1.3em; }
+  #undoBox{ margin-top:10px; display:none; padding:8px 10px; background:rgba(184,134,59,0.12); border:1px solid rgba(184,134,59,0.4); border-radius:6px; }
+  #undoBox button{ margin-right:8px; }
+  #undoStatus{ font-size:0.85rem; color:#7a6f5a; margin-top:6px; min-height:1.3em; }
 </style>
 </head>
 <body>
@@ -104,6 +107,18 @@
       </div>
       <div class="row">
         <label style="flex:1 1 200px; display:flex; align-items:center; gap:6px;">
+          <input id="extraTurnCheckbox" type="checkbox"> Доп. ход при окружении соперника
+        </label>
+      </div>
+      <div class="row">
+        <label for="firstMoveSel">Кто ходит первым</label>
+        <select id="firstMoveSel">
+          <option value="creator" selected>Я (создатель комнаты)</option>
+          <option value="opponent">Соперник / бот</option>
+        </select>
+      </div>
+      <div class="row">
+        <label style="flex:1 1 200px; display:flex; align-items:center; gap:6px;">
           <input id="vsBotCheckbox" type="checkbox"> Играть с ботом (вместо второго игрока)
         </label>
         <select id="botDifficultySel" style="display:none;">
@@ -148,8 +163,15 @@
     <div id="status">Ждём соперника…</div>
     <canvas id="board" width="600" height="480"></canvas>
     <div style="margin-top:10px; display:flex; gap:10px; justify-content:center;">
+      <button id="undoBtn" style="display:none;">Отменить свой последний ход</button>
       <button id="endBtn">Закончить игру</button>
       <button id="leaveBtn">Покинуть комнату</button>
+    </div>
+    <div id="undoStatus"></div>
+    <div id="undoBox">
+      <div id="undoBoxText"></div>
+      <button id="undoApproveBtn">Согласиться</button>
+      <button id="undoDeclineBtn">Отклонить</button>
     </div>
     <div id="rematchBox">
       <button id="rematchBtn">Играть ещё раз</button>
@@ -175,6 +197,8 @@
   const vsBotCheckbox = document.getElementById('vsBotCheckbox');
   const botDifficultySel = document.getElementById('botDifficultySel');
   const isPublicCheckbox = document.getElementById('isPublicCheckbox');
+  const extraTurnCheckbox = document.getElementById('extraTurnCheckbox');
+  const firstMoveSel = document.getElementById('firstMoveSel');
   const refreshRoomsBtn = document.getElementById('refreshRoomsBtn');
   const roomListEl = document.getElementById('roomListEl');
   const roomListEmptyEl = document.getElementById('roomListEmpty');
@@ -197,6 +221,12 @@
   const p2LabelEl = document.getElementById('p2Label');
   const endBtn = document.getElementById('endBtn');
   const leaveBtn = document.getElementById('leaveBtn');
+  const undoBtn = document.getElementById('undoBtn');
+  const undoStatusEl = document.getElementById('undoStatus');
+  const undoBoxEl = document.getElementById('undoBox');
+  const undoBoxTextEl = document.getElementById('undoBoxText');
+  const undoApproveBtn = document.getElementById('undoApproveBtn');
+  const undoDeclineBtn = document.getElementById('undoDeclineBtn');
 
   // --- Учётная запись (регистрация/вход) ---------------------------------
   // Это независимый от игры слой: партии по-прежнему можно создавать без
@@ -325,6 +355,12 @@
   let seat = null;
   let snapshot = null;
   let isSpectator = false;
+  // Ждём ли мы ответа на СВОЙ собственный запрос на отмену хода — пока
+  // ждём, кнопка недоступна (нельзя запросить повторно) и показывается
+  // статус "ждём соперника". Сбрасывается при разрешении запроса
+  // (undo-applied через 'state', либо 'undo-declined') или при уходе из
+  // комнаты.
+  let awaitingOwnUndoResponse = false;
   // Имена мест: {1: 'Ник' | null, 2: 'Ник' | null} — приходят от сервера
   // (playerNames в room-created/room-joined/match-found/reconnected/state)
   // и отражают ник из учётной записи, если игрок вошёл. null — гость,
@@ -371,7 +407,15 @@
     'seat-occupied': 'Это место уже занято (партия открыта в другой вкладке?).',
     'game-over': 'Партия уже завершена.',
     'game-not-over': 'Партия ещё не закончена.',
-    'not-in-room': 'Вы сейчас не в комнате.'
+    'not-in-room': 'Вы сейчас не в комнате.',
+    'undo-pending': 'Дождитесь ответа на запрос отмены хода.',
+    'undo-already-requested': 'Запрос на отмену уже отправлен, ждём ответа.',
+    'not-your-move-to-undo': 'Отменить можно только свой последний ход.',
+    'opponent-unavailable': 'Соперника сейчас нет за столом — отменить некому подтвердить.',
+    'no-pending-undo': 'Нет запроса на отмену, который можно подтвердить.',
+    'cannot-approve-own-request': 'Свой же запрос на отмену подтверждать не нужно.',
+    'cannot-decline-own-request': 'Свой же запрос на отмену отклонять не нужно.',
+    'nothing-to-undo': 'Отменять пока нечего — ходов ещё не было.'
   };
 
   function currentMatchOptions(){
@@ -383,6 +427,8 @@
   }
   function currentCreateOptions(){
     const opts = currentMatchOptions();
+    if (extraTurnCheckbox.checked) opts.extraTurnOnCapture = true;
+    if (firstMoveSel.value === 'opponent') opts.firstMove = 'opponent';
     if (vsBotCheckbox.checked){
       opts.vsBot = true;
       opts.botDifficulty = botDifficultySel.value;
@@ -549,15 +595,21 @@
     spectatorBannerEl.style.display = isSpectator ? 'block' : 'none';
     endBtn.style.display = isSpectator ? 'none' : 'inline-block';
     hideRematchUI();
+    hideUndoUI();
     let extra = '';
     if (kind === 'spectate') extra = '';
     else if (kind === 'vsBot') extra = ' Играете против бота.';
     else if (kind === 'auto') extra = ' Соперник найден автоматически.';
     else if (kind === 'reconnected') extra = ' Вы переподключились к партии.';
     else if (seat === 1) extra = ' Дайте этот код второму игроку.';
+    const rules = initialSnapshot && initialSnapshot.rules;
+    const ruleNotes = [];
+    if (rules && rules.extraTurnOnCapture) ruleNotes.push('доп. ход за окружение');
+    if (rules && rules.firstPlayer === 2) ruleNotes.push(`первым ходит ${displayName(2)}`);
+    const ruleText = ruleNotes.length ? ` (${ruleNotes.join(', ')})` : '';
     metaEl.textContent = isSpectator
-      ? `Партия в комнате ${code}.`
-      : `Вы играете за ${displayName(seat)} (место ${seat}).` + extra;
+      ? `Партия в комнате ${code}.${ruleText}`
+      : `Вы играете за ${displayName(seat)} (место ${seat}).` + extra + ruleText;
     resize();
     render();
     if (!isSpectator && snapshot && snapshot.gameOver) showRematchUI();
@@ -573,6 +625,20 @@
     rematchBoxEl.style.display = 'none';
     rematchStatusEl.textContent = '';
     rematchBtn.disabled = false;
+  }
+
+  // undo-box (нижняя карточка "согласиться/отклонить") — показывается ТОЛЬКО
+  // тому игроку, кого попросили подтвердить отмену; undoStatus — короткая
+  // строка над кнопками для того, кто сам отправил запрос ("ждём ответа…").
+  function showUndoRequestUI(requesterSeat){
+    undoBoxTextEl.textContent = `${displayName(requesterSeat)} просит отменить свой последний ход. Согласны?`;
+    undoBoxEl.style.display = 'block';
+  }
+  function hideUndoUI(){
+    undoBoxEl.style.display = 'none';
+    undoBoxTextEl.textContent = '';
+    undoStatusEl.textContent = '';
+    awaitingOwnUndoResponse = false;
   }
 
   function handleMessage(ev){
@@ -639,8 +705,37 @@
     if (msg.type === 'state'){
       snapshot = msg.snapshot;
       if (msg.playerNames) playerNames = msg.playerNames;
+      // Любое новое состояние доски закрывает открытый undo-диалог: если
+      // это state с note:'undo-applied' — запрос был удовлетворён; если
+      // это обычный ход — значит запрос уже был отклонён/снят раньше
+      // (см. сервер: пока pendingUndo висит, ходить нельзя), так что
+      // прятать тут безопасно в обоих случаях.
+      hideUndoUI();
       render();
+      if (msg.extraTurn && !snapshot.gameOver){
+        statusEl.textContent += ' Окружение! Доп. ход.';
+      }
+      if (msg.note === 'undo-applied'){
+        statusEl.textContent += ' Последний ход отменён.';
+      }
       if (snapshot.gameOver && !isSpectator) showRematchUI();
+      return;
+    }
+    if (msg.type === 'undo-requested'){
+      if (msg.seat === seat){
+        // Это подтверждение нашего собственного запроса — ждём ответа.
+        awaitingOwnUndoResponse = true;
+        undoBtn.disabled = true;
+        undoStatusEl.textContent = 'Запрос отправлен, ждём ответа соперника…';
+      } else {
+        showUndoRequestUI(msg.seat);
+      }
+      return;
+    }
+    if (msg.type === 'undo-declined'){
+      hideUndoUI();
+      statusEl.textContent = 'Соперник отклонил отмену хода.';
+      render();
       return;
     }
     if (msg.type === 'opponent-disconnected'){
@@ -651,6 +746,7 @@
     if (msg.type === 'opponent-left'){
       statusEl.textContent = 'Соперник не вернулся и покинул партию.';
       hideRematchUI();
+      hideUndoUI();
       return;
     }
     if (msg.type === 'error'){
@@ -687,7 +783,7 @@
 
   function render(){
     if (!snapshot) return;
-    const { rows, cols, stone, dead, territory, openingZone, current, scores, gameOver, stonesPlacedTotal } = snapshot;
+    const { rows, cols, stone, dead, territory, openingZone, current, scores, gameOver, stonesPlacedTotal, lastMoveByPlayer } = snapshot;
     p1LabelEl.textContent = displayName(1);
     p2LabelEl.textContent = displayName(2);
     s1El.textContent = scores[1];
@@ -810,6 +906,25 @@
       }
     }
 
+    // Подсветка последней точки каждого игрока — золотое кольцо вокруг
+    // камня. Рисуется поверх самих точек, поэтому цикл идёт после них;
+    // координаты берутся из snapshot.lastMoveByPlayer (сервер хранит их
+    // постоянно в состоянии партии, а не только в разовом сообщении о
+    // ходе — переживает переподключение и вход зрителя).
+    if (lastMoveByPlayer){
+      ctx.save();
+      ctx.lineWidth = 2.5;
+      [1, 2].forEach((p) => {
+        const lm = lastMoveByPlayer[p];
+        if (!lm) return;
+        ctx.beginPath();
+        ctx.arc(px(lm.x), py(lm.y), cellSize*0.44, 0, Math.PI*2);
+        ctx.strokeStyle = 'rgba(212,175,55,0.95)';
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+
     if (gameOver){
       let msg;
       if (scores[1] > scores[2]) msg = `Побеждает ${displayName(1)}!`;
@@ -820,6 +935,18 @@
       const turnName = displayName(current);
       const yourTurn = current === seat;
       statusEl.textContent = `Ходит ${turnName}.` + (yourTurn ? ' Ваш ход!' : ' Ждём соперника…');
+    }
+
+    // Кнопка отмены видна только тому, кто реально может её запросить:
+    // самый последний ход в партии — его собственный, партия не окончена,
+    // и нет уже висящего запроса (ни своего, ни от соперника — на это
+    // время undoBox/undoStatus и так занимают внимание).
+    if (isSpectator){
+      undoBtn.style.display = 'none';
+    } else {
+      const canRequestUndo = !gameOver && snapshot.canUndo && snapshot.lastMoverSeat === seat;
+      undoBtn.style.display = canRequestUndo ? 'inline-block' : 'none';
+      undoBtn.disabled = awaitingOwnUndoResponse;
     }
   }
 
@@ -850,6 +977,12 @@
   canvas.addEventListener('click', handlePlace);
   canvas.addEventListener('touchstart', handlePlace, { passive:false });
   endBtn.addEventListener('click', () => ws.send(JSON.stringify({ type: 'end' })));
+  undoBtn.addEventListener('click', () => {
+    if (awaitingOwnUndoResponse) return;
+    ws.send(JSON.stringify({ type: 'request-undo' }));
+  });
+  undoApproveBtn.addEventListener('click', () => ws.send(JSON.stringify({ type: 'undo-approve' })));
+  undoDeclineBtn.addEventListener('click', () => ws.send(JSON.stringify({ type: 'undo-decline' })));
   window.addEventListener('resize', () => { resize(); render(); });
 })();
 </script>

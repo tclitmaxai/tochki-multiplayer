@@ -43,7 +43,7 @@
 
   const DIFFICULTY = {
     normal: { radius:2, candidateCap:10, timeLimit:220, maxDepth:3, branchWide:5, branchMid:4, branchNarrow:3, quiescenceExt:2 },
-    strong: { radius:2, candidateCap:16, timeLimit:550, maxDepth:5, branchWide:7, branchMid:5, branchNarrow:4, quiescenceExt:2 }
+    strong: { radius:4, candidateCap:20, timeLimit:2000, maxDepth:6, branchWide:8, branchMid:6, branchNarrow:5, quiescenceExt:3 }
   };
   const TRAIN_DIFF = { radius:2, candidateCap:14, timeLimit:70, maxDepth:3, branchWide:5, branchMid:4, branchNarrow:3, quiescenceExt:1 };
 
@@ -408,7 +408,7 @@
     const cand = generateCandidates(state, rows, cols, diff.radius)
       .map(c => ({...c, q: quickScore(state, rows, cols, c.x, c.y, player)}))
       .sort((a,b) => b.q - a.q)
-      .slice(0, 6);
+      .slice(0, 10);
     for (const c of cand){
       const s = cloneState(state);
       s.stone[c.y][c.x] = player;
@@ -534,12 +534,40 @@
     const rows = size.rows, cols = size.cols;
     const state = createEmptyState(rows, cols);
 
-    let current = 1;
+    // firstPlayer — кто ставит первую точку партии. По умолчанию 1 (в
+    // серверной модели это всегда создатель комнаты — см. server.js,
+    // где seat 1 закрепляется за создателем), но при создании комнаты
+    // это можно явно передать 2, чтобы первым ходил соперник/бот.
+    const firstPlayer = options.firstPlayer === 2 ? 2 : 1;
+    let current = firstPlayer;
+    // extraTurnOnCapture — доп. ход за окружение: если true, игрок,
+    // чей ход только что привёл к захвату (окружению) точки/точек
+    // соперника, ходит ещё раз вместо передачи хода сопернику.
+    const extraTurnOnCapture = options.extraTurnOnCapture === true;
     const scores = {1:0, 2:0};
+    // Последний ход каждого игрока — отдельно от общего moveLog, чтобы не
+    // пересчитывать его на каждый снимок: нужен именно "последняя точка
+    // игрока 1" и "последняя точка игрока 2" одновременно (а не только
+    // самый последний ход партии в целом), чтобы клиент мог подсветить
+    // обе точки — свою и соперника.
+    const lastMoveByPlayer = { 1: null, 2: null };
     let gameOver = false;
     let stonesPlacedTotal = 0;
     const moveLog = [];
     const totalCells = rows*cols;
+
+    // Стек снимков "состояние прямо перед ходом N" — по одному на каждый
+    // применённый ход, в порядке ходов. Понадобился для отмены хода
+    // (шаг 14): захват мутирует сразу три слоя (stone/dead/territory) плюс
+    // очки, аналитически "развернуть" runCaptures надёжно не получится —
+    // проще и надёжнее просто вернуть весь снимок целиком. Память не
+    // проблема: даже на большом поле (19×15) один снимок — это три
+    // массива по 285 чисел, а ходов за партию не больше totalCells.
+    // Сейчас используется только последний элемент (отмена одного, самого
+    // последнего хода — так решили сознательно, см. обсуждение в чате);
+    // остальной стек хранится на будущее, если позже понадобится отмена
+    // на несколько ходов назад.
+    const history = [];
 
     const targetScore = Math.max(0, Math.min(9999, Math.floor(options.targetScore) || 0));
     let targetFillPercent = options.targetFillPercent;
@@ -547,6 +575,19 @@
     targetFillPercent = Math.max(0, Math.min(100, Math.floor(targetFillPercent)));
     const scoreRuleActive = targetScore > 0;
     const fillRuleActive = targetFillPercent > 0 && targetFillPercent < 100;
+
+    function snapshotForHistory(){
+      return {
+        state: cloneState(state),
+        scores: {...scores},
+        current,
+        stonesPlacedTotal,
+        lastMoveByPlayer: {
+          1: lastMoveByPlayer[1] ? {...lastMoveByPlayer[1]} : null,
+          2: lastMoveByPlayer[2] ? {...lastMoveByPlayer[2]} : null
+        }
+      };
+    }
 
     function isLegal(x, y){
       if (gameOver) return false;
@@ -564,11 +605,15 @@
       if (player !== current) return { ok:false, reason:'not-your-turn' };
       if (!isLegal(x, y)) return { ok:false, reason:'illegal-cell' };
 
+      history.push(snapshotForHistory());
+
       state.stone[y][x] = player;
       stonesPlacedTotal++;
       moveLog.push({x, y, p: player});
+      lastMoveByPlayer[player] = {x, y};
 
       const gained = runCaptures(state, player, rows, cols);
+      moveLog[moveLog.length - 1].gained = gained.length;
       for (const g of gained){
         if (g.prevOwner && g.prevOwner !== player){
           scores[g.prevOwner] = Math.max(0, scores[g.prevOwner] - 1);
@@ -577,10 +622,15 @@
       }
 
       let winner = null;
+      let extraTurn = false;
       const ended = checkEndConditions({ state, rows, cols, scores, scoreRuleActive, targetScore, fillRuleActive, targetFillPercent, totalCells });
       if (ended){
         gameOver = true;
         winner = scores[1] > scores[2] ? 1 : (scores[2] > scores[1] ? 2 : 0);
+      } else if (extraTurnOnCapture && gained.length > 0){
+        // Игрок только что окружил точку(и) соперника — ход остаётся за
+        // ним же (current не меняется), а не переходит сопернику.
+        extraTurn = true;
       } else {
         current = player === 1 ? 2 : 1;
       }
@@ -588,7 +638,7 @@
       return {
         ok: true, player, x, y,
         gained, scores: {...scores}, current, gameOver, winner,
-        stonesPlacedTotal
+        extraTurn, stonesPlacedTotal
       };
     }
 
@@ -598,6 +648,41 @@
       gameOver = true;
       const winner = scores[1] > scores[2] ? 1 : (scores[2] > scores[1] ? 2 : 0);
       return { ok:true, gameOver, winner, scores: {...scores} };
+    }
+
+    // Кто сделал самый последний ход партии (тот, чей ход в принципе можно
+    // отменить прямо сейчас) — null, если ходов ещё не было.
+    function lastMoverSeat(){
+      return moveLog.length ? moveLog[moveLog.length - 1].p : null;
+    }
+
+    // Можно ли сейчас отменить последний ход: партия не окончена и хотя бы
+    // один ход уже сделан. Сама проверка "тот ли игрок просит" и получение
+    // согласия соперника — забота вызывающего кода (см. server.js), движок
+    // отвечает только за то, ЧТО значит "отменить" применительно к доске.
+    function canUndoLastMove(){
+      return !gameOver && history.length > 0;
+    }
+
+    // Отменяет ровно последний применённый ход, откатывая доску, счёт,
+    // очередь хода и счётчик точек к снимку, снятому непосредственно перед
+    // этим ходом (см. history/snapshotForHistory выше). Полный откат, а не
+    // точечная отмена одной точки — единственный надёжный способ учитывая,
+    // что ход мог вызвать захват (сразу три слоя состояния + очки).
+    function undoLastMove(){
+      if (!canUndoLastMove()) return { ok:false, reason: gameOver ? 'game-over' : 'nothing-to-undo' };
+      const prev = history.pop();
+      state.stone = prev.state.stone;
+      state.dead = prev.state.dead;
+      state.territory = prev.state.territory;
+      scores[1] = prev.scores[1];
+      scores[2] = prev.scores[2];
+      current = prev.current;
+      stonesPlacedTotal = prev.stonesPlacedTotal;
+      lastMoveByPlayer[1] = prev.lastMoveByPlayer[1];
+      lastMoveByPlayer[2] = prev.lastMoveByPlayer[2];
+      moveLog.pop();
+      return { ok:true, current, scores: {...scores}, stonesPlacedTotal };
     }
 
     function botMove(difficultyKey, weights){
@@ -614,13 +699,19 @@
         territory: state.territory.map(r => r.slice()),
         current, scores: {...scores}, gameOver, stonesPlacedTotal,
         openingZone: getOpeningZone(rows, cols),
-        rules: { targetScore, targetFillPercent, scoreRuleActive, fillRuleActive, totalCells }
+        lastMoveByPlayer: {
+          1: lastMoveByPlayer[1] ? {...lastMoveByPlayer[1]} : null,
+          2: lastMoveByPlayer[2] ? {...lastMoveByPlayer[2]} : null
+        },
+        lastMoverSeat: lastMoverSeat(),
+        canUndo: canUndoLastMove(),
+        rules: { targetScore, targetFillPercent, scoreRuleActive, fillRuleActive, totalCells, extraTurnOnCapture, firstPlayer }
       };
     }
 
     function getMoveLog(){ return moveLog.slice(); }
 
-    return { rows, cols, sizeKey, applyMove, endNow, botMove, getSnapshot, getMoveLog };
+    return { rows, cols, sizeKey, applyMove, endNow, botMove, getSnapshot, getMoveLog, undoLastMove, canUndoLastMove, lastMoverSeat };
   }
 
   return {

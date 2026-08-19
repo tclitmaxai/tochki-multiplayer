@@ -10,7 +10,20 @@
 //
 // Протокол (JSON-сообщения по WebSocket):
 //   клиент -> сервер:
-//     {type:'create-room', options:{sizeKey, targetScore, targetFillPercent, vsBot, botDifficulty, isPublic}, authToken?}
+//     {type:'create-room', options:{sizeKey, targetScore, targetFillPercent,
+//                                    extraTurnOnCapture, firstMove:'creator'|'opponent',
+//                                    vsBot, botDifficulty, isPublic}, authToken?}
+//   extraTurnOnCapture (шаг 13) — если true, игрок, чей ход привёл к
+//   захвату (окружению) точки/точек соперника, ходит ещё раз, вместо
+//   передачи хода сопернику. Применяется в Engine.createMatch — сервер
+//   лишь пропускает флаг через sanitizeCreateOptions, вся логика в
+//   gameEngine.js (applyMove: result.extraTurn) и в maybeTriggerBotMove
+//   (бот ходит повторно сам, если его ход тоже дал захват).
+//   firstMove (шаг 13) — кто ставит первую точку партии: 'creator'
+//   (по умолчанию, как раньше) или 'opponent' (второй игрок/бот). Место 1
+//   в серверной модели всегда закреплено за создателем комнаты, поэтому
+//   выбор однозначно переводится в firstPlayer:1|2 для Engine.createMatch.
+//   Не применяется к find-match (там нет понятия "создатель").
 //     {type:'join-room', code, authToken?}
 //     {type:'find-match', options:{sizeKey, targetScore, targetFillPercent}, authToken?}
 //     {type:'cancel-find'}
@@ -21,6 +34,9 @@
 //     {type:'spectate-room', code}            — шаг 10: подключиться зрителем к открытой комнате
 //     {type:'leave-room'}                     — немедленно освободить своё место/уйти из зрителей
 //     {type:'rematch'}                        — шаг 10: сыграть ещё раз в той же комнате
+//     {type:'request-undo'}                   — шаг 14: попросить отменить СВОЙ последний ход
+//     {type:'undo-approve'}                   — шаг 14: согласиться на чужой запрос отмены
+//     {type:'undo-decline'}                   — шаг 14: отклонить чужой запрос отмены
 //   authToken — необязательный токен сессии из /api/login (не путать с
 //   token переподключения к месту, который сервер сам генерирует и
 //   присылает клиенту). Если валиден — сервер подставляет ник вместо
@@ -32,16 +48,38 @@
 //     {type:'search-cancelled'}                      — вышел из очереди
 //     {type:'match-found', code, seat, token, snapshot, playerNames}   — обоим сведённым игрокам
 //     {type:'reconnected', code, seat, token, snapshot, vsBot, playerNames}  — успешно вернувшемуся
-//     {type:'state', snapshot, playerNames, lastMove?, note?}     — рассылается обоим (и зрителям)
+//     {type:'state', snapshot, playerNames, lastMove?, note?, extraTurn?}  — рассылается обоим (и зрителям);
+//                                extraTurn:true — этот ход дал доп. ход (см. extraTurnOnCapture)
 //     {type:'opponent-disconnected', seat, graceMs}  — оппонент отвалился, ждём
 //     {type:'opponent-left', seat}                   — оппонент не вернулся — место освобождено
-//     {type:'room-list', rooms:[{code, sizeKey, targetScore, targetFillPercent, status,
+//     {type:'room-list', rooms:[{code, sizeKey, targetScore, targetFillPercent,
+//                                 extraTurnOnCapture, status,
 //                                 playerNames, spectatorCount}]}   — ответ на list-rooms
 //     {type:'spectate-joined', code, snapshot, playerNames, vsBot}   — только зрителю
 //     {type:'rematch-requested', seat}         — один из игроков предложил реванш, ждём второго
 //     {type:'rematch-started', seat, token, snapshot, playerNames, vsBot}   — персонально каждому месту
 //     (зрители получают ту же партию через обычный 'state' с новым snapshot)
+//     {type:'undo-requested', seat}            — seat попросил отменить свой последний ход,
+//                                                 ждём ответа второго игрока (шаг 14)
+//     {type:'undo-declined', seat}             — запрос seat на отмену отклонён соперником
 //     {type:'error', reason}
+//
+// Шаг 14 — отмена последнего хода по согласию соперника:
+//   Отменить можно только САМЫЙ ПОСЛЕДНИЙ ход партии, и только тот игрок,
+//   который его сделал (request-undo от кого-то другого отклоняется).
+//   Пока запрос ждёт ответа, обоим ходить нельзя (см. 'move' → reason
+//   'undo-pending') — иначе можно было бы согласиться отменить уже
+//   неактуальный ход. Против бота согласие бота выставляется автоматически
+//   (см. maybeAutoResolveUndo) — там нет живого второго игрока, которого
+//   можно спросить. Откат восстанавливает доску/счёт/очередь целиком (см.
+//   Engine.undoLastMove) — это касается только живого состояния партии в
+//   памяти: сам ход остаётся в постоянном логе БД (gamelog), т.е.
+//   GET /api/games/:code по-прежнему покажет отменённый ход как факт
+//   истории, просто на доске его больше нет. Отмена хода, которым партия
+//   уже завершилась (gameOver), недоступна — это осознанное решение (см.
+//   обсуждение), как и то, что отмена сейчас не ограничена по количеству
+//   и разрешена даже для хода, вызвавшего захват — оба пункта могут
+//   измениться позже.
 //
 // Шаг 10 — публичные комнаты, зрители и реванш:
 //   При создании комнаты можно пометить её isPublic:true — тогда, пока в
@@ -71,6 +109,20 @@
 //   Только партии со статусом 'finished' входят в статистику — 'abandoned'
 //   (комната брошена недоигранной) — нет.
 //
+// Шаг 11/12 — видимость БД и дообучения бота (HTTP, открыто, без входа):
+//     GET  /api/admin/summary            → {totalGames, gamesByStatus, totalMoves,
+//                                            totalUsers, botWeights:{normal,strong}}
+//     GET  /api/bot/weights/:difficulty  → {difficulty, current, history}
+//   Запуск дообучения (шаг 12) — уже НЕ открытый эндпоинт, нужен
+//   ADMIN_TOKEN (см. README) и заголовок X-Admin-Token:
+//     POST /api/admin/train  {difficulty?, generations?, population?, games?,
+//                              sizeKey?, seed?}  → 202 {started, run}
+//     GET  /api/admin/train  → {running, pid, params, startedAt, finishedAt,
+//                                exitCode, ok, outputTail}
+//   POST спавнит tools/train-bot.js ОТДЕЛЬНЫМ процессом (child_process.spawn)
+//   и сразу отвечает — self-play никогда не считается в процессе сервера,
+//   иначе завис бы event loop и вместе с ним — ходы живых игроков.
+//
 // Запуск:  npm install && npm start   (или PORT=3000 node server.js)
 // Тест:    npm test
 
@@ -78,9 +130,10 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const { WebSocketServer } = require('ws');
 const Engine = require('./gameEngine.js');
-const { openDatabase } = require('./db.js');
+const { openDatabase, resolveDbPath } = require('./db.js');
 const { createAuth } = require('./auth.js');
 const { createGameLog } = require('./gamelog.js');
 
@@ -138,7 +191,8 @@ function generateToken(){
 //          playerNames:{1,2}, playerUserIds:{1,2}, gameId, moveCount,
 //          options, emptyTimer, graceTimers:{1:timer|null,2:timer|null},
 //          vsBot, botSeat, botDifficulty,
-//          isPublic, spectators:Set<ws>, rematchVotes:Set<seat> }
+//          isPublic, spectators:Set<ws>, rematchVotes:Set<seat>,
+//          pendingUndo:{seat}|null }
 function createRoomsRegistry(config){
   const emptyRoomTtlMs = config.emptyRoomTtlMs;
   const reconnectGraceMs = config.reconnectGraceMs;
@@ -193,7 +247,13 @@ function createRoomsRegistry(config){
       // Места (по номеру места), уже согласившиеся сыграть реванш в этой же
       // комнате — см. обработчик 'rematch'. Сбрасывается при старте новой
       // партии и при уходе игрока с места.
-      rematchVotes: new Set()
+      rematchVotes: new Set(),
+      // Шаг 14: запрос на отмену последнего хода, ожидающий ответа второго
+      // игрока — {seat: <кто попросил>} | null. Живёт только между
+      // 'request-undo' и его разрешением ('undo-approve'/'undo-decline'
+      // или сброс места). Пока запрос висит, ходить нельзя (см. 'move') —
+      // иначе можно было бы согласиться отменить уже неактуальный ход.
+      pendingUndo: null
     };
     rooms.set(code, room);
     return room;
@@ -300,6 +360,7 @@ function roomListEntry(room){
     sizeKey: room.match.sizeKey,
     targetScore: room.options.targetScore || 0,
     targetFillPercent: typeof room.options.targetFillPercent === 'number' ? room.options.targetFillPercent : 100,
+    extraTurnOnCapture: room.options.extraTurnOnCapture === true,
     status,
     playerNames: room.playerNames,
     spectatorCount: room.spectators.size
@@ -329,7 +390,7 @@ function serveStatic(req, res){
 // Возвращает true, если запрос был обработан как /api/* маршрут (в этом
 // случае вызывающий код ничего больше с res делать не должен), иначе false —
 // тогда запрос отдаётся дальше на serveStatic.
-async function handleApiRequest(req, res, auth, gameLog){
+async function handleApiRequest(req, res, auth, gameLog, admin){
   const urlObj = new URL(req.url, 'http://internal');
   const urlPath = urlObj.pathname;
   if (!urlPath.startsWith('/api/')) return false;
@@ -448,8 +509,137 @@ async function handleApiRequest(req, res, auth, gameLog){
     return true;
   }
 
+  // Шаг 12: запуск/статус дообучения бота — см. createTrainingRunner()
+  // выше про то, почему это отдельный процесс, а не код в этом файле.
+  // Единая проверка авторизации на оба эндпоинта: без ADMIN_TOKEN в
+  // окружении сервера — 503 (осознанно выключено), с ним — нужен тот же
+  // секрет в заголовке X-Admin-Token.
+  if (urlPath === '/api/admin/train' && (req.method === 'POST' || req.method === 'GET')){
+    if (!admin.training.isEnabled()) return sendJson(res, 503, { error: 'admin-training-disabled', reason: 'ADMIN_TOKEN не задан в окружении сервера' }), true;
+    if (!safeEqualStrings(req.headers['x-admin-token'], admin.adminToken)) return sendJson(res, 403, { error: 'forbidden' }), true;
+    if (req.method === 'GET') return sendJson(res, 200, admin.training.publicState()), true;
+    let body = {};
+    try { body = await readJsonBody(req); } catch (err){ body = {}; } // тело необязательно — без него берутся дефолты train-bot.js
+    const result = admin.training.start(body);
+    if (!result.ok){
+      const status = result.reason === 'already-running' ? 409 : 400;
+      return sendJson(res, status, { error: result.reason, run: admin.training.publicState() }), true;
+    }
+    sendJson(res, 202, { started: true, run: admin.training.publicState() });
+    return true;
+  }
+
   sendJson(res, 404, { error: 'not-found' });
   return true;
+}
+
+// Простое сравнение строк без утечки через тайминг — тем же приёмом, что
+// verifyPassword() в auth.js, но без соли/хэширования: ADMIN_TOKEN — это
+// один статический секрет из окружения, а не пароль пользователя.
+function safeEqualStrings(a, b){
+  const bufA = Buffer.from(String(a == null ? '' : a));
+  const bufB = Buffer.from(String(b == null ? '' : b));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// Шаг 12 — POST /api/admin/train (запуск дообучения бота, вариант «В» из
+// обсуждения): эндпоинт только СПАВНИТ tools/train-bot.js ОТДЕЛЬНЫМ
+// процессом (child_process.spawn) и сразу отвечает — сам self-play
+// (синхронный alphaBeta-перебор) НИКОГДА не считается внутри процесса
+// сервера, иначе на всё время обучения зависли бы ходы живых игроков (та
+// же причина, по которой ход самого бота стоило бы в будущем вынести в
+// worker_threads — см. README). Дочерний процесс независим: упадёт или
+// зависнет — на текущие партии это не повлияет.
+//
+// Защита: включается только если задан ADMIN_TOKEN (переменная окружения
+// или serverOptions.adminToken) — без него эндпоинт всегда отвечает 503, а
+// не молча остаётся открытым. Запрос должен нести тот же секрет в
+// заголовке X-Admin-Token. Без этого кто угодно смог бы бесплатно грузить
+// CPU сервера повторными запусками self-play.
+function createTrainingRunner({ dbPath, adminToken }){
+  const state = { running: false, pid: null, params: null, startedAt: null, finishedAt: null, exitCode: null, ok: null, output: [] };
+
+  function pushLine(line){
+    state.output.push(line);
+    // Держим только хвост лога — это статус для человека в браузере/curl,
+    // не полноценное хранилище логов; полная история решений бота и так
+    // остаётся в bot_weights.note (см. GET /api/bot/weights/:difficulty).
+    if (state.output.length > 200) state.output.shift();
+  }
+
+  function sanitizeParams(raw){
+    raw = raw || {};
+    const clampInt = (v, lo, hi, def) => {
+      const n = parseInt(v, 10);
+      return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def;
+    };
+    return {
+      difficulty: (typeof raw.difficulty === 'string' && Engine.DIFFICULTY[raw.difficulty]) ? raw.difficulty : 'strong',
+      // Верхние границы — не про качество обучения, а чтобы один вызов
+      // эндпоинта не мог случайно/намеренно запустить многочасовой прогон.
+      generations: clampInt(raw.generations, 1, 50, 4),
+      population: clampInt(raw.population, 1, 20, 4),
+      games: clampInt(raw.games, 1, 100, 8),
+      sizeKey: (typeof raw.sizeKey === 'string' && Engine.SIZES[raw.sizeKey]) ? raw.sizeKey : 'medium',
+      seed: Number.isFinite(parseInt(raw.seed, 10)) ? (parseInt(raw.seed, 10) >>> 0) : (Date.now() >>> 0)
+    };
+  }
+
+  function start(rawParams){
+    if (state.running) return { ok: false, reason: 'already-running' };
+    if (dbPath === ':memory:'){
+      // Дочерний процесс откроет СВОЙ ':memory:' — отдельная, никак не
+      // связанная с работающим сервером база; результат обучения просто
+      // потеряется. В реальном деплое это не встречается (см. db.js) —
+      // это защита конкретно от такого несовпадения.
+      return { ok: false, reason: 'in-memory-db' };
+    }
+    const params = sanitizeParams(rawParams);
+    const args = [
+      path.join(__dirname, 'tools', 'train-bot.js'),
+      '--difficulty', params.difficulty,
+      '--generations', String(params.generations),
+      '--population', String(params.population),
+      '--games', String(params.games),
+      '--size', params.sizeKey,
+      '--seed', String(params.seed),
+      '--db', dbPath
+    ];
+    const child = spawn(process.execPath, args, { cwd: __dirname });
+    state.running = true;
+    state.pid = child.pid;
+    state.params = params;
+    state.startedAt = Date.now();
+    state.finishedAt = null;
+    state.exitCode = null;
+    state.ok = null;
+    state.output = [];
+    child.stdout.on('data', (chunk) => { for (const line of chunk.toString().split('\n')) if (line) pushLine(line); });
+    child.stderr.on('data', (chunk) => { for (const line of chunk.toString().split('\n')) if (line) pushLine('[stderr] ' + line); });
+    child.on('close', (code) => {
+      state.running = false;
+      state.finishedAt = Date.now();
+      state.exitCode = code;
+      state.ok = code === 0;
+    });
+    child.on('error', (err) => {
+      state.running = false;
+      state.finishedAt = Date.now();
+      state.ok = false;
+      pushLine('[spawn-error] ' + err.message);
+    });
+    return { ok: true, params, pid: child.pid };
+  }
+
+  function publicState(){
+    // outputTail, а не весь output — GET-ответ не должен незаметно
+    // разрастись до сотен строк лога на каждый опрос статуса.
+    const { output, ...rest } = state;
+    return { ...rest, outputTail: output.slice(-30) };
+  }
+
+  return { start, publicState, isEnabled: () => !!adminToken };
 }
 
 function sanitizeCreateOptions(raw){
@@ -458,6 +648,17 @@ function sanitizeCreateOptions(raw){
   if (typeof raw.sizeKey === 'string' && Engine.SIZES[raw.sizeKey]) options.sizeKey = raw.sizeKey;
   if (Number.isFinite(raw.targetScore)) options.targetScore = raw.targetScore;
   if (Number.isFinite(raw.targetFillPercent)) options.targetFillPercent = raw.targetFillPercent;
+  // extraTurnOnCapture — доп. ход за окружение (шаг 13); решает создатель
+  // комнаты, применяется прямо в Engine.createMatch (см. gameEngine.js).
+  if (raw.extraTurnOnCapture === true) options.extraTurnOnCapture = true;
+  // firstMove — кто ставит первую точку партии: 'creator' (по умолчанию,
+  // как и раньше) или 'opponent' (второй игрок/бот). В серверной модели
+  // место 1 всегда закреплено за создателем комнаты (см. create-room
+  // ниже), поэтому выбор однозначно переводится в firstPlayer: 1|2 для
+  // движка. Не имеет смысла для матчмейкинга (find-match) — там нет
+  // понятия "создатель", поэтому normalizeMatchOptions это поле не читает.
+  if (raw.firstMove === 'opponent') options.firstPlayer = 2;
+  else if (raw.firstMove === 'creator') options.firstPlayer = 1;
   return options;
 }
 
@@ -503,9 +704,18 @@ function createServer(serverOptions){
 
   // dbPath: ':memory:' удобно для тестов (см. test/e2e.js) — не оставляет
   // файлов на диске и каждый прогон теста начинает с чистой базы.
-  const db = serverOptions.db || openDatabase(serverOptions.dbPath);
+  const dbPath = resolveDbPath(serverOptions.dbPath);
+  const db = serverOptions.db || openDatabase(dbPath);
   const auth = createAuth(db);
   const gameLog = createGameLog(db);
+
+  // ADMIN_TOKEN пуст по умолчанию — это осознанно ВЫКЛЮЧАЕТ
+  // /api/admin/train, а не оставляет его открытым (см. createTrainingRunner
+  // выше). Чтобы включить: ADMIN_TOKEN=... в окружении сервера (или
+  // serverOptions.adminToken при создании сервера тестами/встраиванием).
+  const ADMIN_TOKEN = serverOptions.adminToken !== undefined ? serverOptions.adminToken : (process.env.ADMIN_TOKEN || '');
+  const training = createTrainingRunner({ dbPath, adminToken: ADMIN_TOKEN });
+  const adminCtx = { training, adminToken: ADMIN_TOKEN };
 
   const {
     rooms, createRoom, getRoom, freeSeat,
@@ -535,7 +745,7 @@ function createServer(serverOptions){
   }
 
   const httpServer = http.createServer((req, res) => {
-    handleApiRequest(req, res, auth, gameLog).then((handled) => {
+    handleApiRequest(req, res, auth, gameLog, adminCtx).then((handled) => {
       if (!handled) serveStatic(req, res);
     }).catch((err) => {
       console.error('API error:', err);
@@ -601,6 +811,24 @@ function createServer(serverOptions){
     if (result.gameOver) gameLog.finish(room, result.winner, result.scores, 'rule');
   }
 
+  // Применяет уже одобренную отмену последнего хода (согласием живого
+  // соперника или авто-согласием бота — см. вызовы ниже) и рассылает
+  // новое состояние. moveCount НЕ уменьшаем: это счётчик строк в
+  // персистентном логе БД (gamelog), а не число точек на доске — лог
+  // остаётся честной историей партии, включая отменённый ход (см. шапку
+  // файла). Живая доска в памяти при этом полностью откатывается.
+  function applyApprovedUndo(room){
+    const result = room.match.undoLastMove();
+    room.pendingUndo = null;
+    if (!result.ok) return result;
+    broadcastRoom(room, stateMessage(room, { note: 'undo-applied' }));
+    // Если после отмены снова наступила очередь бота (например, отменили
+    // ход человека, который шёл после хода бота, и до отмены ход опять
+    // был передан человеку) — пусть бот походит сам, как обычно.
+    maybeTriggerBotMove(room);
+    return result;
+  }
+
   function maybeTriggerBotMove(room){
     if (!room.vsBot) return;
     const snap = room.match.getSnapshot();
@@ -615,7 +843,11 @@ function createServer(serverOptions){
       const result = stillThere.match.applyMove(stillThere.botSeat, move.x, move.y);
       if (!result.ok) return; // защитная проверка — по правилам бот всегда должен ходить легально
       recordMoveInLog(stillThere, stillThere.botSeat, move.x, move.y, result);
-      broadcastRoom(stillThere, stateMessage(stillThere, { lastMove: { x: move.x, y: move.y, player: stillThere.botSeat } }));
+      broadcastRoom(stillThere, stateMessage(stillThere, { lastMove: { x: move.x, y: move.y, player: stillThere.botSeat }, extraTurn: result.extraTurn }));
+      // extraTurnOnCapture: если ход бота сам привёл к захвату, ход
+      // остаётся за ботом (current не сменился) — считаем ещё один ход,
+      // а не ждём (несуществующего) хода человека.
+      maybeTriggerBotMove(stillThere);
     }, BOT_MOVE_DELAY_MS);
   }
 
@@ -628,6 +860,7 @@ function createServer(serverOptions){
     room.match = Engine.createMatch(room.options);
     room.moveCount = 0;
     room.rematchVotes = new Set();
+    room.pendingUndo = null;
     room.gameId = gameLog.startGame(room);
     const snapshot = room.match.getSnapshot();
     [1, 2].forEach((seat) => {
@@ -635,6 +868,9 @@ function createServer(serverOptions){
       if (seatWs) send(seatWs, { type:'rematch-started', seat, token: room.tokens[seat], snapshot, playerNames: room.playerNames, vsBot: room.vsBot });
     });
     broadcastSpectators(room, { type:'state', snapshot, playerNames: room.playerNames, note:'rematch-started' });
+    // Как и при create-room: если по правилам комнаты первым ходит бот
+    // (firstMove:'opponent'), реванш тоже должен начаться с его хода.
+    maybeTriggerBotMove(room);
   }
 
   wss.on('connection', (ws) => {
@@ -660,6 +896,10 @@ function createServer(serverOptions){
         const token = seatWithToken(room, 1, ws, resolvePlayer(msg.authToken));
         room.gameId = gameLog.startGame(room);
         send(ws, { type:'room-created', code: room.code, seat: 1, token, snapshot: room.match.getSnapshot(), vsBot, isPublic, playerNames: room.playerNames });
+        // firstMove:'opponent' против бота — бот ходит первым сам, без
+        // ожидания хода человека (обычно эту роль выполняет вызов после
+        // 'move' человека, но здесь человек ещё не ходил вовсе).
+        maybeTriggerBotMove(room);
         return;
       }
 
@@ -768,6 +1008,10 @@ function createServer(serverOptions){
         room.seats[seat] = null;
         room.tokens[seat] = null;
         room.rematchVotes.delete(seat);
+        // Соперник ушёл — любой висящий запрос на отмену хода больше не
+        // имеет смысла: либо ушёл тот, кто просил (спрашивать уже некого),
+        // либо тот, кто должен был согласиться (некому подтвердить).
+        room.pendingUndo = null;
         ws.roomCode = null; ws.seat = null;
         send(ws, { type:'left-room' });
         broadcastRoom(room, { type:'opponent-left', seat });
@@ -809,10 +1053,11 @@ function createServer(serverOptions){
       if (!room || !ws.seat) return send(ws, { type:'error', reason:'not-in-room' });
 
       if (msg.type === 'move'){
+        if (room.pendingUndo) return send(ws, { type:'error', reason:'undo-pending' });
         const result = room.match.applyMove(ws.seat, msg.x, msg.y);
         if (!result.ok) return send(ws, { type:'error', reason: result.reason });
         recordMoveInLog(room, ws.seat, msg.x, msg.y, result);
-        broadcastRoom(room, stateMessage(room, { lastMove: { x: msg.x, y: msg.y, player: ws.seat } }));
+        broadcastRoom(room, stateMessage(room, { lastMove: { x: msg.x, y: msg.y, player: ws.seat }, extraTurn: result.extraTurn }));
         maybeTriggerBotMove(room);
         return;
       }
@@ -822,6 +1067,47 @@ function createServer(serverOptions){
         if (!result.ok) return send(ws, { type:'error', reason: result.reason });
         gameLog.finish(room, result.winner, result.scores, 'manual');
         broadcastRoom(room, stateMessage(room));
+        return;
+      }
+
+      if (msg.type === 'request-undo'){
+        if (room.pendingUndo) return send(ws, { type:'error', reason:'undo-already-requested' });
+        const seat = ws.seat;
+        if (!room.match.canUndoLastMove()) return send(ws, { type:'error', reason: room.match.getSnapshot().gameOver ? 'game-over' : 'nothing-to-undo' });
+        // Отменить можно только СВОЙ последний ход — иначе это уже не
+        // "я ошибся", а попытка отменить ход соперника без его на то воли.
+        if (room.match.lastMoverSeat() !== seat) return send(ws, { type:'error', reason:'not-your-move-to-undo' });
+
+        if (room.vsBot){
+          // У бота нет своей воли, которую можно спросить — согласие
+          // выставляется автоматически, отмена применяется сразу же.
+          applyApprovedUndo(room);
+          return;
+        }
+
+        const opponentSeat = seat === 1 ? 2 : 1;
+        const opponentWs = room.seats[opponentSeat];
+        if (!opponentWs) return send(ws, { type:'error', reason:'opponent-unavailable' });
+
+        room.pendingUndo = { seat };
+        send(opponentWs, { type:'undo-requested', seat });
+        send(ws, { type:'undo-requested', seat });
+        return;
+      }
+
+      if (msg.type === 'undo-approve'){
+        if (!room.pendingUndo) return send(ws, { type:'error', reason:'no-pending-undo' });
+        if (ws.seat === room.pendingUndo.seat) return send(ws, { type:'error', reason:'cannot-approve-own-request' });
+        applyApprovedUndo(room);
+        return;
+      }
+
+      if (msg.type === 'undo-decline'){
+        if (!room.pendingUndo) return send(ws, { type:'error', reason:'no-pending-undo' });
+        if (ws.seat === room.pendingUndo.seat) return send(ws, { type:'error', reason:'cannot-decline-own-request' });
+        const requesterSeat = room.pendingUndo.seat;
+        room.pendingUndo = null;
+        send(room.seats[requesterSeat], { type:'undo-declined', seat: requesterSeat });
         return;
       }
 
@@ -855,6 +1141,9 @@ function createServer(serverOptions){
         const seat = ws.seat;
         room.seats[seat] = null;
         room.rematchVotes.delete(seat);
+        // Как и при явном leave-room — висящий запрос на отмену теряет
+        // смысл, если кто-то из двоих внезапно отвалился по сети.
+        room.pendingUndo = null;
         broadcastRoom(room, { type:'opponent-disconnected', seat, graceMs: reconnectGraceMs });
         armSeatGraceTimer(room, seat, () => {
           broadcastRoom(room, { type:'opponent-left', seat });
@@ -864,7 +1153,7 @@ function createServer(serverOptions){
     });
   });
 
-  return { httpServer, wss, rooms, db, auth, gameLog };
+  return { httpServer, wss, rooms, db, auth, gameLog, training, dbPath };
 }
 
 if (require.main === module){
