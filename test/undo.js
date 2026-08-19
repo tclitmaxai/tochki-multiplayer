@@ -227,8 +227,43 @@ async function main(){
     c1.close();
   }
 
+  // 5) undoAllowed:false — создатель отключил отмену хода для всей партии.
+  {
+    const c1 = new WebSocket(url);
+    await new Promise((r) => c1.on('open', r));
+    c1.send(JSON.stringify({ type:'create-room', options:{ sizeKey:'small', undoAllowed:false } }));
+    const created = await onceMessage(c1);
+    assert.strictEqual(created.snapshot.rules.undoAllowed, false, 'снимок отражает выключенное правило');
+    assert.strictEqual(created.snapshot.canUndo, false, 'canUndo сразу false, даже до первого хода');
+    const code = created.code;
+
+    const c2 = new WebSocket(url);
+    await new Promise((r) => c2.on('open', r));
+    c2.send(JSON.stringify({ type:'join-room', code }));
+    await onceMessage(c2);
+    await onceMessage(c1);
+
+    const zone = created.snapshot.openingZone;
+    c1.send(JSON.stringify({ type:'move', x: zone.minX, y: zone.minY }));
+    const [afterMove1] = await Promise.all([
+      onceMessage(c1, m => m.type === 'state'),
+      onceMessage(c2, m => m.type === 'state'),
+    ]);
+    assert.strictEqual(afterMove1.snapshot.lastMoverSeat, 1);
+    assert.strictEqual(afterMove1.snapshot.canUndo, false, 'даже после реального хода отмена недоступна');
+
+    // Запрос на отмену своего же последнего хода всё равно отклоняется —
+    // именно из-за правила комнаты, а не из-за "нечего отменять".
+    c1.send(JSON.stringify({ type:'request-undo' }));
+    const rejected = await onceMessage(c1, m => m.type === 'error');
+    assert.strictEqual(rejected.reason, 'undo-disabled');
+    console.log('OK: undoAllowed:false отключает отмену хода для всей партии (undo-disabled)');
+
+    c1.close(); c2.close();
+  }
+
   httpServer.close();
-  console.log('\nВСЕ ПРОВЕРКИ ОТМЕНЫ ХОДА (шаг 14) ПРОЙДЕНЫ');
+  console.log('\nВСЕ ПРОВЕРКИ ОТМЕНЫ ХОДА (шаг 14/15) ПРОЙДЕНЫ');
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

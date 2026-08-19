@@ -111,6 +111,11 @@
         </label>
       </div>
       <div class="row">
+        <label style="flex:1 1 200px; display:flex; align-items:center; gap:6px;">
+          <input id="undoAllowedCheckbox" type="checkbox" checked> Разрешить отмену хода
+        </label>
+      </div>
+      <div class="row">
         <label for="firstMoveSel">Кто ходит первым</label>
         <select id="firstMoveSel">
           <option value="creator" selected>Я (создатель комнаты)</option>
@@ -199,6 +204,7 @@
   const isPublicCheckbox = document.getElementById('isPublicCheckbox');
   const extraTurnCheckbox = document.getElementById('extraTurnCheckbox');
   const firstMoveSel = document.getElementById('firstMoveSel');
+  const undoAllowedCheckbox = document.getElementById('undoAllowedCheckbox');
   const refreshRoomsBtn = document.getElementById('refreshRoomsBtn');
   const roomListEl = document.getElementById('roomListEl');
   const roomListEmptyEl = document.getElementById('roomListEmpty');
@@ -429,6 +435,9 @@
     const opts = currentMatchOptions();
     if (extraTurnCheckbox.checked) opts.extraTurnOnCapture = true;
     if (firstMoveSel.value === 'opponent') opts.firstMove = 'opponent';
+    // Чекбокс изначально включён (undoAllowed:true — прежнее поведение),
+    // поэтому на сервер отправляем только явное отключение.
+    if (!undoAllowedCheckbox.checked) opts.undoAllowed = false;
     if (vsBotCheckbox.checked){
       opts.vsBot = true;
       opts.botDifficulty = botDifficultySel.value;
@@ -606,6 +615,7 @@
     const ruleNotes = [];
     if (rules && rules.extraTurnOnCapture) ruleNotes.push('доп. ход за окружение');
     if (rules && rules.firstPlayer === 2) ruleNotes.push(`первым ходит ${displayName(2)}`);
+    if (rules && rules.undoAllowed === false) ruleNotes.push('отмена хода отключена');
     const ruleText = ruleNotes.length ? ` (${ruleNotes.join(', ')})` : '';
     metaEl.textContent = isSpectator
       ? `Партия в комнате ${code}.${ruleText}`

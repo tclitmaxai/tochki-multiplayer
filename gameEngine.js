@@ -544,6 +544,13 @@
     // чей ход только что привёл к захвату (окружению) точки/точек
     // соперника, ходит ещё раз вместо передачи хода сопернику.
     const extraTurnOnCapture = options.extraTurnOnCapture === true;
+    // undoAllowed — разрешена ли в этой партии отмена хода вообще; решает
+    // создатель комнаты при её создании (по умолчанию true — как и было
+    // раньше, отмена доступна всем). Если false, canUndoLastMove() всегда
+    // возвращает false независимо от истории ходов, т.е. кнопка отмены и
+    // весь протокол request-undo/undo-approve/undo-decline для этой партии
+    // просто не активируются — ни для людей, ни (см. server.js) для бота.
+    const undoAllowed = options.undoAllowed !== false;
     const scores = {1:0, 2:0};
     // Последний ход каждого игрока — отдельно от общего moveLog, чтобы не
     // пересчитывать его на каждый снимок: нужен именно "последняя точка
@@ -661,7 +668,7 @@
     // согласия соперника — забота вызывающего кода (см. server.js), движок
     // отвечает только за то, ЧТО значит "отменить" применительно к доске.
     function canUndoLastMove(){
-      return !gameOver && history.length > 0;
+      return undoAllowed && !gameOver && history.length > 0;
     }
 
     // Отменяет ровно последний применённый ход, откатывая доску, счёт,
@@ -670,6 +677,7 @@
     // точечная отмена одной точки — единственный надёжный способ учитывая,
     // что ход мог вызвать захват (сразу три слоя состояния + очки).
     function undoLastMove(){
+      if (!undoAllowed) return { ok:false, reason:'undo-disabled' };
       if (!canUndoLastMove()) return { ok:false, reason: gameOver ? 'game-over' : 'nothing-to-undo' };
       const prev = history.pop();
       state.stone = prev.state.stone;
@@ -705,7 +713,7 @@
         },
         lastMoverSeat: lastMoverSeat(),
         canUndo: canUndoLastMove(),
-        rules: { targetScore, targetFillPercent, scoreRuleActive, fillRuleActive, totalCells, extraTurnOnCapture, firstPlayer }
+        rules: { targetScore, targetFillPercent, scoreRuleActive, fillRuleActive, totalCells, extraTurnOnCapture, firstPlayer, undoAllowed }
       };
     }
 

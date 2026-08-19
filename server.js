@@ -12,7 +12,12 @@
 //   клиент -> сервер:
 //     {type:'create-room', options:{sizeKey, targetScore, targetFillPercent,
 //                                    extraTurnOnCapture, firstMove:'creator'|'opponent',
-//                                    vsBot, botDifficulty, isPublic}, authToken?}
+//                                    undoAllowed, vsBot, botDifficulty, isPublic}, authToken?}
+//   undoAllowed (шаг 15) — разрешена ли отмена хода в этой партии; решает
+//   создатель комнаты. По умолчанию true (как и раньше — отмена доступна
+//   всем). Если false, request-undo для этой комнаты всегда отклоняется
+//   с reason:'undo-disabled', а canUndo в снимке (см. getSnapshot) всегда
+//   false — клиент прячет кнопку отмены сам, ориентируясь на это поле.
 //   extraTurnOnCapture (шаг 13) — если true, игрок, чей ход привёл к
 //   захвату (окружению) точки/точек соперника, ходит ещё раз, вместо
 //   передачи хода сопернику. Применяется в Engine.createMatch — сервер
@@ -79,7 +84,8 @@
 //   уже завершилась (gameOver), недоступна — это осознанное решение (см.
 //   обсуждение), как и то, что отмена сейчас не ограничена по количеству
 //   и разрешена даже для хода, вызвавшего захват — оба пункта могут
-//   измениться позже.
+//   измениться позже. Саму возможность отмены целиком для партии можно
+//   выключить опцией undoAllowed:false при создании комнаты (см. выше).
 //
 // Шаг 10 — публичные комнаты, зрители и реванш:
 //   При создании комнаты можно пометить её isPublic:true — тогда, пока в
@@ -361,6 +367,7 @@ function roomListEntry(room){
     targetScore: room.options.targetScore || 0,
     targetFillPercent: typeof room.options.targetFillPercent === 'number' ? room.options.targetFillPercent : 100,
     extraTurnOnCapture: room.options.extraTurnOnCapture === true,
+    undoAllowed: room.options.undoAllowed !== false,
     status,
     playerNames: room.playerNames,
     spectatorCount: room.spectators.size
@@ -659,6 +666,11 @@ function sanitizeCreateOptions(raw){
   // понятия "создатель", поэтому normalizeMatchOptions это поле не читает.
   if (raw.firstMove === 'opponent') options.firstPlayer = 2;
   else if (raw.firstMove === 'creator') options.firstPlayer = 1;
+  // undoAllowed — разрешена ли отмена хода в этой партии; решает создатель
+  // комнаты (шаг 15). По умолчанию true (прежнее поведение — отмена всегда
+  // доступна), поэтому передаём в Engine.createMatch только явное false.
+  // Дальше вся логика — в gameEngine.js (canUndoLastMove/undoLastMove).
+  if (raw.undoAllowed === false) options.undoAllowed = false;
   return options;
 }
 
@@ -1073,7 +1085,11 @@ function createServer(serverOptions){
       if (msg.type === 'request-undo'){
         if (room.pendingUndo) return send(ws, { type:'error', reason:'undo-already-requested' });
         const seat = ws.seat;
-        if (!room.match.canUndoLastMove()) return send(ws, { type:'error', reason: room.match.getSnapshot().gameOver ? 'game-over' : 'nothing-to-undo' });
+        if (!room.match.canUndoLastMove()){
+          const snap = room.match.getSnapshot();
+          const reason = !snap.rules.undoAllowed ? 'undo-disabled' : (snap.gameOver ? 'game-over' : 'nothing-to-undo');
+          return send(ws, { type:'error', reason });
+        }
         // Отменить можно только СВОЙ последний ход — иначе это уже не
         // "я ошибся", а попытка отменить ход соперника без его на то воли.
         if (room.match.lastMoverSeat() !== seat) return send(ws, { type:'error', reason:'not-your-move-to-undo' });
