@@ -36,16 +36,16 @@
     : () => Date.now();
 
   const SIZES = {
-    small:  { cols: 11, rows: 9  },
-    medium: { cols: 15, rows: 11 },
-    large:  { cols: 19, rows: 15 }
+    small:  { cols: 12, rows: 10  },
+    medium: { cols: 16, rows: 12 },
+    large:  { cols: 22, rows: 16 }
   };
 
   const DIFFICULTY = {
     normal: { radius:2, candidateCap:10, timeLimit:220, maxDepth:3, branchWide:5, branchMid:4, branchNarrow:3, quiescenceExt:2 },
     strong: { radius:4, candidateCap:20, timeLimit:2000, maxDepth:6, branchWide:8, branchMid:6, branchNarrow:5, quiescenceExt:3 }
   };
-  const TRAIN_DIFF = { radius:2, candidateCap:14, timeLimit:70, maxDepth:3, branchWide:5, branchMid:4, branchNarrow:3, quiescenceExt:1 };
+  const TRAIN_DIFF = { radius:3, candidateCap:16, timeLimit:700, maxDepth:4, branchWide:6, branchMid:6, branchNarrow:4, quiescenceExt:3 };
 
   const BOT_PLAYER = 2;
   // liberty — вес нового термина «безопасность групп» (см. computeGroupLiberties
