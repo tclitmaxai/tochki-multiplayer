@@ -142,6 +142,7 @@ const Engine = require('./gameEngine.js');
 const { openDatabase, resolveDbPath } = require('./db.js');
 const { createAuth } = require('./auth.js');
 const { createGameLog } = require('./gamelog.js');
+const TrainBot = require('./tools/train-bot.js');
 
 const MAX_JSON_BODY_BYTES = 10 * 1024; // регистрация/вход — маленькие тела, больше не нужно
 
@@ -536,6 +537,77 @@ async function handleApiRequest(req, res, auth, gameLog, admin){
     return true;
   }
 
+  // Пилот actor-learner (внешний оптимизатор, например Colab, присылает
+  // веса-кандидата — сервер СИНХРОННО прогоняет self-play и сразу отдаёт
+  // результат, ничего не сохраняя в bot_weights). В отличие от
+  // /api/admin/train это НЕ спавнит дочерний процесс: расчёт блокирует
+  // event loop на время запроса. Это осознанно приемлемо только на
+  // выделенном под обучение инстансе без живых игроков — см. обсуждение
+  // в переписке. На проде с реальными игроками эта ручка не должна
+  // вызываться параллельно с их ходами.
+  if (urlPath === '/api/admin/selfplay-eval' && req.method === 'POST'){
+    if (!admin.training.isEnabled()) return sendJson(res, 503, { error: 'admin-training-disabled', reason: 'ADMIN_TOKEN не задан в окружении сервера' }), true;
+    if (!safeEqualStrings(req.headers['x-admin-token'], admin.adminToken)) return sendJson(res, 403, { error: 'forbidden' }), true;
+    let body;
+    try { body = await readJsonBody(req); } catch (err){ return sendJson(res, 400, { error: 'invalid-json-body' }), true; }
+
+    const candidateWeights = body && body.candidateWeights;
+    if (!candidateWeights || typeof candidateWeights !== 'object'){
+      return sendJson(res, 400, { error: 'candidateWeights-required' }), true;
+    }
+    const sizeKey = (typeof body.sizeKey === 'string' && Engine.SIZES[body.sizeKey]) ? body.sizeKey : 'medium';
+    const games = Math.max(1, Math.min(200, parseInt(body.games, 10) || 20));
+    const seed = Number.isFinite(parseInt(body.seed, 10)) ? (parseInt(body.seed, 10) >>> 0) : (Date.now() >>> 0);
+    const fillPercent = (body.fillPercent === undefined || body.fillPercent === null)
+      ? undefined
+      : Math.max(1, Math.min(100, parseInt(body.fillPercent, 10) || 60));
+    const difficulty = (typeof body.difficulty === 'string' && Engine.DIFFICULTY[body.difficulty]) ? body.difficulty : 'strong';
+
+    const incumbentWeights = (body.incumbentWeights && typeof body.incumbentWeights === 'object')
+      ? body.incumbentWeights
+      : (gameLog.getCurrentBotWeights(difficulty) || { ...Engine.BOT_WEIGHTS });
+
+    const startedAt = Date.now();
+    const openings = TrainBot.loadOpenings(gameLog, sizeKey, 6);
+    const rng = TrainBot.makeRng(seed);
+    const result = TrainBot.contest(sizeKey, openings, incumbentWeights, candidateWeights, games, rng, fillPercent);
+    const elapsedMs = Date.now() - startedAt;
+
+    sendJson(res, 200, {
+      ...result, elapsedMs, gamesPlayed: games, openingsUsed: openings.length,
+      sizeKey, fillPercent: fillPercent ?? null, seed
+    });
+    return true;
+  }
+
+  // Ручное сохранение готовых весов (например, финальный результат пилота
+  // с Colab) — в отличие от /api/admin/train ничего не считает сама, только
+  // валидирует и пишет новую строку в bot_weights (та же таблица/история,
+  // что и у tools/train-bot.js). source в БД будет 'external' — по нему
+  // в GET /api/bot/weights/:difficulty видно, что это не local self-play.
+  if (urlPath === '/api/admin/bot-weights' && req.method === 'POST'){
+    if (!admin.training.isEnabled()) return sendJson(res, 503, { error: 'admin-training-disabled', reason: 'ADMIN_TOKEN не задан в окружении сервера' }), true;
+    if (!safeEqualStrings(req.headers['x-admin-token'], admin.adminToken)) return sendJson(res, 403, { error: 'forbidden' }), true;
+    let body;
+    try { body = await readJsonBody(req); } catch (err){ return sendJson(res, 400, { error: 'invalid-json-body' }), true; }
+
+    const difficulty = (typeof body.difficulty === 'string' && Engine.DIFFICULTY[body.difficulty]) ? body.difficulty : null;
+    if (!difficulty) return sendJson(res, 400, { error: 'unknown-difficulty' }), true;
+    const w = body.weights;
+    if (!w || !TrainBot.WEIGHT_KEYS.every(k => typeof w[k] === 'number' && Number.isFinite(w[k]))){
+      return sendJson(res, 400, { error: 'weights-must-include', keys: TrainBot.WEIGHT_KEYS }), true;
+    }
+
+    gameLog.saveBotWeights(difficulty, w, {
+      source: 'external',
+      winRate: typeof body.winRate === 'number' ? body.winRate : null,
+      gamesPlayed: typeof body.gamesPlayed === 'number' ? body.gamesPlayed : null,
+      note: typeof body.note === 'string' ? body.note.slice(0, 500) : 'загружено вручную через /api/admin/bot-weights'
+    });
+    sendJson(res, 201, { saved: true, difficulty, weights: w });
+    return true;
+  }
+
   sendJson(res, 404, { error: 'not-found' });
   return true;
 }
@@ -589,7 +661,13 @@ function createTrainingRunner({ dbPath, adminToken }){
       population: clampInt(raw.population, 1, 20, 4),
       games: clampInt(raw.games, 1, 100, 8),
       sizeKey: (typeof raw.sizeKey === 'string' && Engine.SIZES[raw.sizeKey]) ? raw.sizeKey : 'medium',
-      seed: Number.isFinite(parseInt(raw.seed, 10)) ? (parseInt(raw.seed, 10) >>> 0) : (Date.now() >>> 0)
+      seed: Number.isFinite(parseInt(raw.seed, 10)) ? (parseInt(raw.seed, 10) >>> 0) : (Date.now() >>> 0),
+      // необязательный override условия окончания self-play партий (см.
+      // --fill-percent в tools/train-bot.js); undefined = поведение по
+      // умолчанию (дебют реальной партии либо 35%).
+      fillPercent: (raw.fillPercent === undefined || raw.fillPercent === null)
+        ? undefined
+        : clampInt(raw.fillPercent, 1, 100, undefined)
     };
   }
 
@@ -613,6 +691,7 @@ function createTrainingRunner({ dbPath, adminToken }){
       '--seed', String(params.seed),
       '--db', dbPath
     ];
+    if (params.fillPercent !== undefined) args.push('--fill-percent', String(params.fillPercent));
     const child = spawn(process.execPath, args, { cwd: __dirname });
     state.running = true;
     state.pid = child.pid;

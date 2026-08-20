@@ -46,7 +46,12 @@ const { createGameLog } = require('../gamelog.js');
 function parseArgs(argv){
   const out = {
     difficulty: 'strong', generations: 4, population: 4, games: 8,
-    dbPath: undefined, sizeKey: 'medium', seed: Date.now() >>> 0
+    dbPath: undefined, sizeKey: 'medium', seed: Date.now() >>> 0,
+    // undefined = поведение по умолчанию (targetFillPercent реальной партии,
+    // если есть дебют из БД, иначе 35 — см. playSelfPlayGame). Если задан
+    // явно через --fill-percent, self-play партии ВСЕГДА играются до этого
+    // процента заполнения поля, независимо от того, какой был у дебюта.
+    fillPercent: undefined
   };
   for (let i = 0; i < argv.length; i++){
     const a = argv[i];
@@ -58,6 +63,7 @@ function parseArgs(argv){
     else if (a === '--db') out.dbPath = val();
     else if (a === '--size') out.sizeKey = val();
     else if (a === '--seed') out.seed = parseInt(val(), 10) >>> 0;
+    else if (a === '--fill-percent') out.fillPercent = parseInt(val(), 10);
   }
   return out;
 }
@@ -129,11 +135,17 @@ function pickMove(match, weights){
 }
 
 // weightsBySeat: {1: weights, 2: weights}. Возвращает 1, 2 или 0 (ничья).
-function playSelfPlayGame(sizeKey, opening, weightsBySeat, maxMoves){
+// fillPercentOverride — если задан (см. --fill-percent), игнорирует и
+// targetFillPercent реального дебюта, и дефолт 35 — self-play партия всегда
+// идёт до этого процента заполнения поля.
+function playSelfPlayGame(sizeKey, opening, weightsBySeat, maxMoves, fillPercentOverride){
+  const targetFillPercent = fillPercentOverride != null
+    ? fillPercentOverride
+    : (opening ? opening.targetFillPercent : 35);
   const match = Engine.createMatch({
     sizeKey,
     targetScore: opening ? opening.targetScore : 0,
-    targetFillPercent: opening ? opening.targetFillPercent : 35
+    targetFillPercent
   });
 
   if (opening){
@@ -168,7 +180,7 @@ function playSelfPlayGame(sizeKey, opening, weightsBySeat, maxMoves){
 // через раз — иначе один из наборов весов систематически получал бы
 // преимущество/недостаток первого хода (право первого хода в этой игре
 // значимо, как и в го).
-function contest(sizeKey, openings, incumbent, candidate, games, rng){
+function contest(sizeKey, openings, incumbent, candidate, games, rng, fillPercentOverride){
   let candidateWins = 0, incumbentWins = 0, draws = 0;
   for (let i = 0; i < games; i++){
     const opening = openings.length ? openings[Math.floor(rng() * openings.length)] : null;
@@ -176,7 +188,7 @@ function contest(sizeKey, openings, incumbent, candidate, games, rng){
     const weightsBySeat = candidateSeat === 1
       ? { 1: candidate, 2: incumbent }
       : { 1: incumbent, 2: candidate };
-    const winner = playSelfPlayGame(sizeKey, opening, weightsBySeat, 260);
+    const winner = playSelfPlayGame(sizeKey, opening, weightsBySeat, 260, fillPercentOverride);
     if (winner === 0) draws++;
     else if (winner === candidateSeat) candidateWins++;
     else incumbentWins++;
@@ -201,6 +213,9 @@ function main(){
   let incumbent = gameLog.getCurrentBotWeights(args.difficulty) || { ...Engine.BOT_WEIGHTS };
   let incumbentLabel = 'стартовые (БД или дефолт из движка)';
   console.log('Стартовые веса:', incumbent);
+  console.log(args.fillPercent != null
+    ? `Условие окончания self-play партий: заполнение поля ${args.fillPercent}% (переопределено --fill-percent, дебюты игнорируются в части этого правила)`
+    : 'Условие окончания self-play партий: targetFillPercent реального дебюта, либо 35% по умолчанию');
 
   let totalGamesPlayed = 0;
   let lastWinRate = null;
@@ -214,7 +229,7 @@ function main(){
 
     for (let p = 0; p < args.population; p++){
       const candidate = mutate(incumbent, rng, strength);
-      const result = contest(args.sizeKey, openings, incumbent, candidate, args.games, rng);
+      const result = contest(args.sizeKey, openings, incumbent, candidate, args.games, rng, args.fillPercent);
       totalGamesPlayed += args.games;
       console.log(
         `  поколение ${gen}, кандидат ${p + 1}/${args.population}: ` +
@@ -252,4 +267,14 @@ function main(){
   db.close();
 }
 
-main();
+// Только когда файл запущен напрямую (node tools/train-bot.js) — не когда
+// server.js делает require('./tools/train-bot.js') для переиспользования
+// contest()/loadOpenings() в /api/admin/selfplay-eval (см. server.js).
+if (require.main === module){
+  main();
+}
+
+module.exports = {
+  parseArgs, makeRng, mutate, loadOpenings, playSelfPlayGame, contest,
+  WEIGHT_KEYS, WEIGHT_BOUNDS
+};
